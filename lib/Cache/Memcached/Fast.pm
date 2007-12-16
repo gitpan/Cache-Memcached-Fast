@@ -10,16 +10,15 @@ use warnings;
 
 =head1 NAME
 
-Cache::Memcached::Fast - Perl client for
-L<memcached|http://www.danga.com/memcached/>, in C language
+Cache::Memcached::Fast - Perl client for B<memcached>, in C language
 
 =head1 VERSION
 
-Version 0.02
+Version 0.03
 
 =cut
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
 
 =head1 SYNOPSIS
@@ -84,7 +83,7 @@ our $VERSION = '0.02';
 
 =head1 DESCRIPTION
 
-B<Cache::Memcahced::Fast> is a Perl client for memcached, a memory
+B<Cache::Memcahced::Fast> is a Perl client for B<memcached>, a memory
 cache daemon (L<http://www.danga.com/memcached/>).  Module core is
 implemented in C and tries hard to minimize number of system calls and
 to avoid any key/value copying for speed.  As a result, it has very
@@ -93,7 +92,7 @@ low CPU consumption.
 API is largely compatible with L<Cache::Memcached|Cache::Memcached>,
 original pure Perl client, most users of the original module may start
 using this module by installing it and adding I<"::Fast"> to the old
-name in their scripts (see L<"Compatibility with Cache::Memcached">
+name in their scripts (see L</"Compatibility with Cache::Memcached">
 below for full details).
 
 
@@ -188,8 +187,8 @@ than 32768.
   (default: '')
 
 The value is a scalar that will be prepended to all key names passed
-to the memcached server.  By using different namespaces clients avoid
-interference with each other.
+to the B<memcached> server.  By using different namespaces clients
+avoid interference with each other.
 
 
 =item I<connect_timeout>
@@ -208,7 +207,7 @@ general case (especially for IPv6, see
 L<http://people.redhat.com/drepper/linux-rfc3484.html> and
 L<http://people.redhat.com/drepper/userapi-ipv6.html>), then the
 attempt to connect to one of those addresses.  I<connect_timeout>
-applies only to one such connect, i.e. to one L<connect(2)|connect>
+applies only to one such connect, i.e. to one I<connect(2)>
 call.  Thus overall connect process may take longer than
 I<connect_timeout> seconds, but this is unavoidable.
 
@@ -222,7 +221,7 @@ The value is a non-negative rational number of seconds to wait before
 giving up on communicating with the server(s).  Zero disables timeout.
 
 Note that for commands that communicate with more than one server
-(like L<get_multi>) the timeout applies per server set, not per each
+(like L</get_multi>) the timeout applies per server set, not per each
 server.  Thus it won't expire if one server is quick enough to
 communicate, even if others are silent.  But if some servers are dead
 those alive will finish communication, and then dead servers would
@@ -236,7 +235,7 @@ timeout.
 
 The value is a boolean which enables (true) or disables (false)
 I<close_on_error> mode.  When enabled, any error response from the
-memcached server would make client close the connection.  Note that
+B<memcached> server would make client close the connection.  Note that
 such "error response" is different from "negative response".  The
 latter means the server processed the command and yield negative
 result.  The former means the server failed to process the command for
@@ -268,7 +267,7 @@ Consider the following scenario:
 But the client expects one reply per command, so after sending the
 next command it will think that the second 'ERROR' is a reply for this
 new command.  This means that all replies would shift, including
-replies for L<get> commands!  By closing the connection we avoid such
+replies for L</get> commands!  By closing the connection we avoid such
 possibility.
 
 When connection dies, or the client receives the reply that it can't
@@ -283,7 +282,7 @@ setting.
 
 The value is an integer.  When positive it denotes the threshold size
 in bytes: data with the size equal or larger than this should be
-compressed.  See L<compress_ratio> and L<compress_algo> below.
+compressed.  See L</compress_ratio> and L</compress_algo> below.
 
 Negative value disables compression.
 
@@ -294,9 +293,9 @@ Negative value disables compression.
   (default: 0.8)
 
 The value is a fractional number between 0 and 1.  When
-L<compress_threshold> triggers the compression, compressed size should
-be less or equal to S<(original-size * I<compress_ratio>)>.  Otherwise
-the data will be stored uncompressed.
+L</compress_threshold> triggers the compression, compressed size
+should be less or equal to S<(original-size * I<compress_ratio>)>.
+Otherwise the data will be stored uncompressed.
 
 
 =item I<compress_algo>
@@ -328,7 +327,7 @@ seconds.  Value of zero disables this behaviour.
   (default: 10 seconds)
 
 The value is a positive integer number of seconds.  See
-L<max_failures>.
+L</max_failures>.
 
 
 =item I<ketama_points>
@@ -348,7 +347,7 @@ of such products.  But bin structures themselves are small (two
 integers each), so you probably shouldn't worry.
 
 Zero value disables the Ketama algorithm.  See also server weight in
-L<servers> above.
+L</servers> above.
 
 
 =back
@@ -398,7 +397,7 @@ Enable compression when boolean I<$enable> is true, disable when
 false.
 
 Note that you can enable compression only when you set
-L<compress_threshold> to some positive value and L<compress_algo>
+L</compress_threshold> to some positive value and L</compress_algo>
 holds the name of a known compression algorithm.
 
 I<Return:> none.
@@ -512,13 +511,15 @@ sub set {
 
 Store the I<$value> on the server under the I<$key>, but only if CAS
 (I<Consistent Access Storage>) value associated with this key is equal
-to I<$cas>.  I<$cas> is an opaque object returned with L<gets> or
-L<gets_multi>.
+to I<$cas>.  I<$cas> is an opaque object returned with L</gets> or
+L</gets_multi>.
 
-See L<set> for I<$key>, I<$value>, I<$expiration_time> parameters
+See L</set> for I<$key>, I<$value>, I<$expiration_time> parameters
 description.
 
 I<Return:> boolean, true if operation succeeded, false otherwise.
+
+This command first appears in B<memcached> 1.2.4.
 
 =cut
 
@@ -537,7 +538,7 @@ sub cas {
 Store the I<$value> on the server under the I<$key>, but only if the
 key B<doesn't> exists on the server.
 
-See L<set> for I<$key>, I<$value>, I<$expiration_time> parameters
+See L</set> for I<$key>, I<$value>, I<$expiration_time> parameters
 description.
 
 I<Return:> boolean, true if operation succeeded, false otherwise.
@@ -559,7 +560,7 @@ sub add {
 Store the I<$value> on the server under the I<$key>, but only if the
 key B<does> exists on the server.
 
-See L<set> for I<$key>, I<$value>, I<$expiration_time> parameters
+See L</set> for I<$key>, I<$value>, I<$expiration_time> parameters
 description.
 
 I<Return:> boolean, true if operation succeeded, false otherwise.
@@ -585,6 +586,8 @@ the server.  C<append> doesn't affect expiration time of the value.
 
 I<Return:> boolean, true if operation succeeded, false otherwise.
 
+This command first appears in B<memcached> 1.2.4.
+
 =cut
 
 sub append {
@@ -606,6 +609,8 @@ I<$key> and I<$value> should be scalars, as well as current value on
 the server.  C<append> doesn't affect expiration time of the value.
 
 I<Return:> boolean, true if operation succeeded, false otherwise.
+
+This command first appears in B<memcached> 1.2.4.
 
 =cut
 
@@ -679,7 +684,7 @@ Retrieve the value and its CAS for a I<$key>.  I<$key> should be a
 scalar.
 
 I<Return:> reference to an array I<[$cas, $value]>, or nothing.  You
-may conveniently pass it back to L<cas> with I<@$res>:
+may conveniently pass it back to L</cas> with I<@$res>:
 
   my $cas_val = $memd->gets($key);
   # Update value.
@@ -687,6 +692,8 @@ may conveniently pass it back to L<cas> with I<@$res>:
       $$cas_val[1] = 3;
       $memd->cas($key, @$cas_val);
   }
+
+This command first appears in B<memcached> 1.2.4.
 
 =cut
 
@@ -712,7 +719,9 @@ Retrieve several values and their CASs associated with I<@keys>.
 I<@keys> should be an array of scalars.
 
 I<Return:> reference to hash, where I<$href-E<gt>{$key}> holds a
-reference to an array I<[$cas, $value]>.  Compare with L<gets>.
+reference to an array I<[$cas, $value]>.  Compare with L</gets>.
+
+This command first appears in B<memcached> 1.2.4.
 
 =cut
 
@@ -735,6 +744,33 @@ sub gets_multi {
 }
 
 
+=item C<incr>
+
+  $memd->incr($key);
+  $memd->incr($key, $increment);
+
+Increment the value for the I<$key>.  If current value is not a
+number, zero is assumed.  An optional I<$increment> should be a
+positive integer, when not given 1 is assumed.  Note that the server
+doesn't check for overflow.
+
+I<Return:> unsigned integer, new value for the I<$key>, or nothing.
+
+
+=item C<decr>
+
+  $memd->decr($key);
+  $memd->decr($key, $decrement);
+
+Decrement the value for the I<$key>.  If current value is not a
+number, zero is assumed.  An optional I<$decrement> should be a
+positive integer, when not given 1 is assumed.  Note that the server
+I<does> check for underflow, attempt to decrement the value below zero
+would set the value to zero.
+
+I<Return:> unsigned integer, new value for the I<$key>, or nothing.
+
+
 =item C<delete> (or deprecated C<remove>)
 
   $memd->delete($key);
@@ -742,7 +778,7 @@ sub gets_multi {
 
 Delete I<$key> and its value from the cache.  I<$delay> is an optional
 non-negative integer number of seconds to delay the operation.  During
-this time L<add> and L<replace> commands will be rejected by the
+this time L</add> and L</replace> commands will be rejected by the
 server.  When omitted, zero is assumed, i.e. delete immediately.
 
 I<Return:> boolean, true if operation succeeded, false otherwise.
@@ -784,7 +820,7 @@ This module is designed to be a drop in replacement for
 L<Cache::Memcached|Cache::Memcached>.  Where constructor parameters
 are the same as in Cache::Memcached, the default values are also the
 same, and new parameters are disabled by default (the exception is
-L<close_on_error>, which is absent in Cache::Memcached and enabled by
+L</close_on_error>, which is absent in Cache::Memcached and enabled by
 default in this module).  Internally Cache::Memcached::Fast uses the
 same hash function as Cache::Memcached, and thus should distribute the
 keys across several servers the same way.  So both modules may be used
@@ -802,8 +838,8 @@ of them will never be):
 
 =item I<no_rehash>
 
-Current implementation never rehashes keys, instead L<max_failures>
-and L<failure_timeout> are used.
+Current implementation never rehashes keys, instead L</max_failures>
+and L</failure_timeout> are used.
 
 
 =item I<readonly>
@@ -839,17 +875,17 @@ construction.
 
 =item C<set_debug>
 
-Not supported.  See L<debug>.
+Not supported.  See L</debug>.
 
 
 =item C<set_readonly>
 
-Not supported.  See L<readonly>.
+Not supported.  See L</readonly>.
 
 
 =item C<set_norehash>
 
-Not supported.  See L<no_rehash>.
+Not supported.  See L</no_rehash>.
 
 
 =item C<set_compress_threshold>
@@ -923,10 +959,10 @@ L<http://search.cpan.org/dist/Cache-Memcached-Fast>
 
 =head1 SEE ALSO
 
-L<Cache::Memcached|Cache::Memcached> - original pure Perl memcached
+L<Cache::Memcached|Cache::Memcached> - original pure Perl B<memcached>
 client.
 
-L<http://www.danga.com/memcached/> - memcached website.
+L<http://www.danga.com/memcached/> - B<memcached> website.
 
 
 =head1 AUTHORS
