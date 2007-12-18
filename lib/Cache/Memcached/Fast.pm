@@ -14,11 +14,11 @@ Cache::Memcached::Fast - Perl client for B<memcached>, in C language
 
 =head1 VERSION
 
-Version 0.04
+Version 0.05
 
 =cut
 
-our $VERSION = '0.04';
+our $VERSION = '0.05';
 
 
 =head1 SYNOPSIS
@@ -357,10 +357,10 @@ L</servers> above.
 =cut
 
 sub new {
-    my $class = shift;
+    my Cache::Memcached::Fast $self = shift;
     my ($conf) = @_;
 
-    my $self = fields::new($class);
+    $self = fields::new($self) unless ref($self);
 
     # $conf->{compress_threshold} == 0 actually disables compression.
     $self->{compress_threshold} = $conf->{compress_threshold} || -1;
@@ -756,6 +756,13 @@ doesn't check for overflow.
 
 I<Return:> unsigned integer, new value for the I<$key>, or nothing.
 
+=cut
+
+sub incr {
+    my Cache::Memcached::Fast $self = shift;
+    return $self->{_xs}->incr(@_);
+}
+
 
 =item C<decr>
 
@@ -770,6 +777,13 @@ would set the value to zero.
 
 I<Return:> unsigned integer, new value for the I<$key>, or nothing.
 
+=cut
+
+sub decr {
+    my Cache::Memcached::Fast $self = shift;
+    return $self->{_xs}->decr(@_);
+}
+
 
 =item C<delete> (or deprecated C<remove>)
 
@@ -782,6 +796,15 @@ this time L</add> and L</replace> commands will be rejected by the
 server.  When omitted, zero is assumed, i.e. delete immediately.
 
 I<Return:> boolean, true if operation succeeded, false otherwise.
+
+=cut
+
+# remove is still loaded via AUTOLOAD, if we mention is here we'll
+# have to document it as a separate =item.
+sub delete {
+    my Cache::Memcached::Fast $self = shift;
+    return $self->{_xs}->delete(@_);
+}
 
 
 =item C<flush_all>
@@ -800,6 +823,14 @@ I<Return:> boolean, true if operation succeeded, false otherwise.
 
 =cut
 
+sub flush_all {
+    my Cache::Memcached::Fast $self = shift;
+    return $self->{_xs}->flush_all(@_);
+}
+
+
+# AOUTOLOAD is used for commands that are not yet official and
+# documented.
 sub AUTOLOAD {
     my Cache::Memcached::Fast $self = shift;
     my ($method) = $AUTOLOAD =~ /::([^:]+)$/;
@@ -911,6 +942,17 @@ or
   $memd = undef;
 
 =back
+
+
+=head1 UTF-8 and tainted data
+
+Current implementation does not preserve UTF-8 flag on scalars.
+Storing UTF-8 string and retrieving it back would return the same byte
+sequence, but UTF-8 flag will be forgotten.  See L<utf8|utf8>.
+
+Likewise, tainted flag is neither tested nor preserved, storing
+tainted data and retrieving it back would clear tainted flag.  See
+L<perlsec|perlsec>.
 
 
 =head1 BUGS

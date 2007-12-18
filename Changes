@@ -1,6 +1,36 @@
 Revision history for Perl extension Cache::Memcached::Fast.
 
 
+0.05  2007-12-18
+        - more fixes to build and pass tests on different platforms.
+        There's no functional changes again.
+
+        Changes since 0.04:
+
+        At least on Perl 5.6.2 SVREF typemap entry has the meaning of
+        the class based on blessed SV.  So instead of SVREF we use
+        custom Ref_SV and custom typemap entry.  Found by CPAN
+        testers.
+
+        Do not use AUTOLOAD for normal commands, only for undocumented
+        ones.
+
+        Add incr() and decr() to script/compare.pl and
+        script/benchmark.pl.
+
+        Test case is split into several files and cleaned a bit.
+
+        Rename 'sun' -> 's_unix' in connect.c, because 'sun' is
+        reserved on... guesses?  Right, Sun systems!  Found by CPAN
+        testers.
+
+        Fix test case for FreeBSD and derivatives: do not use
+        localhost.localdomain address, which FreeBSD doesn't resolve
+        by default.
+
+        Added docs section "UTF-8 and tainted data".
+
+
 0.04  2007-12-16
         - CPAN testers found more issues on different platforms,
         fixing these.
