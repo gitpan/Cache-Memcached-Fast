@@ -1,6 +1,30 @@
 Revision history for Perl extension Cache::Memcached::Fast.
 
 
+0.06  2007-12-20
+        - this release fixes a serious bug and features the 'nowait'
+        mode.  Upgrade is recommended.
+
+        Changes since 0.05:
+
+        Fix a subtle race bug present since 0.02 that could mix
+        several values into one when you have more than one memcached
+        server and executed get_multi or gets_multi.  If you have seen
+        the following in your logs or on the console:
+
+          Attempt to free unreferenced scalar: SV 0x9e89d34 at
+          /tmp/Cache-Memcached-Fast/blib/lib/Cache/Memcached/Fast.pm line 688.
+
+        that was it.
+
+        Added 'nowait' mode that allows the client to not wait the
+        reply, and thus reduces the wallclock time.  Run
+        script/benchmark.pl and see how it affects wallclock time,
+        especially over the wire.
+
+        Made undocumented 'noreply' parameter a per-server setting.
+
+
 0.05  2007-12-18
         - more fixes to build and pass tests on different platforms.
         There's no functional changes again.

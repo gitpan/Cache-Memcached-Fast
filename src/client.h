@@ -67,10 +67,10 @@ typedef unsigned long long arith_type;
 
 typedef char *(*get_key_func)(void *arg, int key_index, size_t *key_len);
 
-typedef void *(*alloc_value_func)(void *arg, value_size_type value_size);
-typedef void (*store_value_func)(void *arg, int key_index, flags_type flags,
-                                 int use_cas, cas_type cas);
-typedef void (*free_value_func)(void *arg);
+typedef void *(*alloc_value_func)(value_size_type value_size, void **opaque);
+typedef void (*store_value_func)(void *arg, void *opaque, int key_index,
+                                 flags_type flags, int use_cas, cas_type cas);
+typedef void (*free_value_func)(void *opaque);
 
 struct value_object
 {
@@ -100,7 +100,8 @@ client_set_ketama_points(struct client *c, int ketama_points);
 extern
 int
 client_add_server(struct client *c, const char *host, size_t host_len,
-                  const char *port, size_t port_len, double weight);
+                  const char *port, size_t port_len, double weight,
+                  int noreply);
 
 extern
 int
@@ -128,7 +129,7 @@ client_set_close_on_error(struct client *c, int enable);
 
 extern
 void
-client_set_noreply(struct client *c, int enable);
+client_set_nowait(struct client *c, int enable);
 
 extern
 int

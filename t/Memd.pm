@@ -19,14 +19,15 @@ BEGIN {
         servers => [ { address => $addr[0], weight => 1.5 },
                      $addr[1] ],
         namespace => 'Cache::Memcached::Fast::',
-        connect_timeout => 0.2,
-        io_timeout => 0.5,
+        connect_timeout => 5,
+        io_timeout => 5,
         close_on_error => 0,
         compress_threshold => 1000,
 #        compress_algo => 'bzip2',
         max_failures => 3,
         failure_timeout => 2,
         ketama_points => 150,
+        nowait => 1,
     });
 
     # Test what server version we have.  server_versions() is
