@@ -14,11 +14,11 @@ Cache::Memcached::Fast - Perl client for B<memcached>, in C language
 
 =head1 VERSION
 
-Version 0.06
+Version 0.07
 
 =cut
 
-our $VERSION = '0.06';
+our $VERSION = '0.07';
 
 
 =head1 SYNOPSIS
@@ -40,24 +40,44 @@ our $VERSION = '0.06';
       failure_timeout => 2,
       ketama_points => 150,
       nowait => 1,
+      serialize_methods => [ \&Storable::freeze, \&Storable::thaw ],
+      utf8 => ($^V >= 5.008001 ? 1 : 0),
   });
+
+  # Get server versions.
+  my $versions = $memd->server_versions;
+  while (my ($server, $version) = each %$versions) {
+      #...
+  }
 
   # Store scalars.
   $memd->add('skey', 'text');
+  $memd->add_multi(['skey2', 'text2'], ['skey3', 'text3', 10]);
+
   $memd->replace('skey', 'val');
+  $memd->replace_multi(['skey2', 'val2'], ['skey3', 'val3']);
+
   $memd->set('nkey', 5);
+  $memd->set_multi(['nkey2', 10], ['skey3', 'text', 5]);
 
   # Store arbitrary Perl data structures.
   my %hash = (a => 1, b => 2);
+  my @list = (1, 2);
   $memd->set('hash', \%hash);
+  $memd->set_multi(['scalar', 1], ['list', \@list]);
 
   # Add to strings.
   $memd->prepend('skey', 'This is a ');
-  $memd->append('skey', 'ule.');
+  $memd->prepend_multi(['skey2', 'This is a '], ['skey3', 'prefix ']);
+  $memd->append('skey', 'ue.');
+  $memd->prepend_multi(['skey2', 'ue.'], ['skey3', ' suffix']);
 
   # Do arithmetic.
   $memd->incr('nkey', 10);
   print "OK\n" if $memd->decr('nkey', 3) == 12;
+
+  my @counters = qw(c1 c2);
+  $memd->incr_multi(['c3', 2], @counters, ['c4', 10]);
 
   # Retrieve values.
   my $val = $memd->get('skey');
@@ -77,6 +97,12 @@ our $VERSION = '0.06';
 
   # Delete some data.
   $memd->delete('skey');
+
+  my @keys = qw(k1 k2 k3);
+  $memd->delete_multi(@keys, ['k5', 20]);
+
+  # Wait for all commands that were executed in nowait mode.
+  $memd->nowait_push;
 
   # Wipe out all cached data.
   $memd->flush_all;
@@ -103,15 +129,8 @@ below for full details).
 use Carp;
 use Storable;
 
-use constant F_STORABLE => 0x1;
-use constant F_COMPRESS => 0x2;
-
-
 require XSLoader;
 XSLoader::load('Cache::Memcached::Fast', $VERSION);
-
-
-our $AUTOLOAD;
 
 
 # BIG FAT WARNING: Perl assignment copies the value, so below we try
@@ -135,17 +154,12 @@ BEGIN {
 
     while (my ($c, $u) = splice(@algo, 0, 2)) {
         my $key = lc $c;
-        my $val = ["IO::Compress::$c", "IO::Compress::${c}::" . lc $c,
-                   "IO::Uncompress::$u", "IO::Uncompress::${u}::" . lc $u];
+        my $val = ["IO::Compress::$c", "IO::Uncompress::$u",
+                   "IO::Compress::${c}::" . lc $c,
+                   "IO::Uncompress::${u}::" . lc $u];
         $compress_algo{$key} = $val;
     }
 }
-
-
-use fields qw(
-    _xs
-    compress_threshold compress_ratio compress_methods
-);
 
 
 =head1 CONSTRUCTOR
@@ -286,9 +300,9 @@ Consider the following scenario:
 
 But the client expects one reply per command, so after sending the
 next command it will think that the second 'ERROR' is a reply for this
-new command.  This means that all replies would shift, including
-replies for L</get> commands!  By closing the connection we avoid such
-possibility.
+new command.  This means that all replies will shift, including
+replies for L</get> commands!  By closing the connection we eliminate
+such possibility.
 
 When connection dies, or the client receives the reply that it can't
 understand, it closes the socket regardless the I<close_on_error>
@@ -361,13 +375,47 @@ B<Ketama> consistent hashing algorithm
 specifies the number of points the server with weight 1 will be mapped
 to.  Thus each server will be mapped to S<I<ketama_points> *
 I<weight>> points in continuum.  Larger value will result in more
-uniform distribution.  Note that the number of internal bin
+uniform distribution.  Note that the number of internal bucket
 structures, and hence memory consumption, will be proportional to sum
-of such products.  But bin structures themselves are small (two
+of such products.  But bucket structures themselves are small (two
 integers each), so you probably shouldn't worry.
 
 Zero value disables the Ketama algorithm.  See also server weight in
 L</servers> above.
+
+
+=item I<serialize_methods>
+
+  serialize_methods => [ \&Storable::freeze, \&Storable::thaw ],
+  (default: [ \&Storable::nfreeze, \&Storable::thaw ])
+
+The value is a reference to an array holding two code references for
+serialization and deserialization routines respectively.
+
+Serialization routine is called when the I<$value> passed to L</set>
+method family is a reference.  The fact that serialization was
+performed is remembered along with the data, and deserialization
+routine is called on data retrieval with L</get> method family.  The
+interface of these routines should be the same as of
+I<Storable::nfreeze> and I<Storable::thaw> (see L<Storable|Storable>).
+I.e. serialization routine takes a reference and returns a scalar
+string; it should not fail.  Deserialization routine takes scalar
+string and returns a reference; if deserialization fails (say, wrong
+data format) it should throw an exception (call I<die>).  The
+exception will be caught by the module and L</get> will then pretend
+that the key hasn't been found.
+
+
+=item I<utf8> (B<experimental, Perl 5.8.1 and later only>)
+
+  utf8 => 1
+  (default: disabled)
+
+The value is a boolean which enables (true) or disables (false) the
+conversion of Perl character strings to octet sequences in UTF-8
+encoding on store, and the reverse conversion on fetch (when the
+retrieved data is marked as being UTF-8 octet sequence).  See
+L<perlunicode|perlunicode>.
 
 
 =back
@@ -377,31 +425,33 @@ L</servers> above.
 =cut
 
 sub new {
-    my Cache::Memcached::Fast $self = shift;
+    my Cache::Memcached::Fast $class = shift;
     my ($conf) = @_;
 
-    $self = fields::new($self) unless ref($self);
-
-    # $conf->{compress_threshold} == 0 actually disables compression.
-    $self->{compress_threshold} = $conf->{compress_threshold} || -1;
-    $self->{compress_ratio} = $conf->{compress_ratio} || 0.8;
-    $self->{compress_methods} =
-      $compress_algo{lc($conf->{compress_algo} || 'gzip')};
-    unless ($self->{compress_methods}) {
+    my $compress = $compress_algo{lc($conf->{compress_algo} || 'gzip')};
+    if (defined $compress) {
+        if (eval "require $compress->[0]"
+            and eval "require $compress->[1]") {
+            no strict 'refs';
+            $conf->{compress_methods} = [ map { \&$_ } @{$compress}[2, 3] ];
+        } else {
+            undef $conf->{compress_methods};
+        }
+    } else {
         carp "Compress algorithm '$conf->{compress_algo}' is not known to"
             . " Cache::Memcached::Fast, disabling compression";
-        $self->{compress_threshold} = -1;
+        undef $conf->{compress_methods};
+        $conf->{compress_threshold} = -1;
     }
 
-    $self->{_xs} = new Cache::Memcached::Fast::_xs($conf);
+    if ($conf->{utf8} and $^V < 5.008001) {
+        carp "'utf8' may be enabled only for Perl >= 5.8.1, disabled";
+        undef $conf->{utf8};
+    }
 
-    return $self;
-}
+    $conf->{serialize_methods} ||= [ \&Storable::nfreeze, \&Storable::thaw ];
 
-
-sub DESTROY {
-    # Do nothing.  Destructor is required for not to call destructor
-    # of Cache::Memcached::Fast::_xs via AUTOLOAD.
+    return Cache::Memcached::Fast::_new($class, $conf);
 }
 
 
@@ -424,79 +474,7 @@ I<Return:> none.
 
 =cut
 
-sub enable_compress {
-    my Cache::Memcached::Fast $self = shift;
-    my ($enable) = @_;
-
-    if ($self->{compress_threshold} > 0
-        xor ($enable and $self->{compress_methods})) {
-        $self->{compress_threshold} = -$self->{compress_threshold};
-    }
-}
-
-
-sub _pack_value {
-    my Cache::Memcached::Fast $self = shift;
-
-    my $flags = 0;
-    my $val_ref;
-
-    # We use $val_ref to avoid both modifying original argument and
-    # copying the value when it is not a reference.
-    if (ref($_[0])) {
-        $val_ref = \Storable::nfreeze($_[0]);
-        $flags |= F_STORABLE;
-    } else {
-        $val_ref = \$_[0];
-    }
-
-    use bytes;
-    my $len = length $$val_ref;
-    if ($self->{compress_threshold} > 0
-        and $len >= $self->{compress_threshold}) {
-        my $methods = $self->{compress_methods};
-        if (eval "require $$methods[0]") {
-            no strict 'refs';
-            my $res = &{$$methods[1]}($val_ref, \my $compressed);
-            if ($res
-                and length $compressed <= $len * $self->{compress_ratio}) {
-                $val_ref = \$compressed;
-                $flags |= F_COMPRESS;
-            }
-        } else {
-            carp "Can't find module $$methods[0]";
-            $self->enable_compress(0);
-        }
-    }
-
-    return ($val_ref, $flags);
-}
-
-
-sub _unpack_value {
-    my Cache::Memcached::Fast $self = shift;
-
-    if ($_[1] & F_COMPRESS) {
-        my $methods = $self->{compress_methods};
-        if (eval "require $$methods[2]") {
-            no strict 'refs';
-            my $res = &{$$methods[3]}($_[0], \my $uncompressed);
-            return unless $res;
-            $_[0] = \$uncompressed;
-        } else {
-            return;
-        }
-    }
-
-    if ($_[1] & F_STORABLE) {
-        eval {
-            $_[0] = \Storable::thaw(${$_[0]});
-        };
-        return if $@;
-    }
-
-    return 1;
-}
+# See Fast.xs.
 
 
 =item C<set>
@@ -513,15 +491,38 @@ Optional I<$expiration_time> is a positive integer number of seconds
 after which the value will expire and wouldn't be accessible any
 longer.
 
-I<Return:> boolean, true if operation succeeded, false otherwise.
+I<Return:> boolean, true for positive server reply, false for negative
+server reply, or I<undef> in case of some error.
 
 =cut
 
-sub set {
-    my Cache::Memcached::Fast $self = shift;
-    splice(@_, 1, 1, _pack_value($self, $_[1]));
-    return $self->{_xs}->set(@_);
-}
+# See Fast.xs.
+
+
+=item C<set_multi>
+
+  $memd->set_multi(
+      [$key, $value],
+      [$key, $value, $expiration_time],
+      ...
+  );
+
+Like L</set>, but operates on more than one key.  Takes the list of
+references to arrays each holding I<$key>, I<$value> and optional
+I<$expiration_time>.
+
+Note that multi commands are not all-or-nothing, some operations may
+succeed, while others may fail.
+
+I<Return:> in list context returns the list of results, each
+I<$list[$index]> is the result value corresponding to the argument at
+position I<$index>.  In scalar context, hash reference is returned,
+where I<$href-E<gt>{$key}> hols the result value.  See L</set> to
+learn what the result value is.
+
+=cut
+
+# See Fast.xs.
 
 
 =item C<cas>
@@ -537,17 +538,45 @@ L</gets_multi>.
 See L</set> for I<$key>, I<$value>, I<$expiration_time> parameters
 description.
 
-I<Return:> boolean, true if operation succeeded, false otherwise.
+I<Return:> boolean, true for positive server reply, false for negative
+server reply, or I<undef> in case of some error.  Thus if the key
+exists on the server, false would mean that some other client has
+updated the value, and L</gets>, L</cas> command sequence should be
+repeated.
 
-This command first appears in B<memcached> 1.2.4.
+B<cas> command first appeared in B<memcached> 1.2.4.
 
 =cut
 
-sub cas {
-    my Cache::Memcached::Fast $self = shift;
-    splice(@_, 2, 1, _pack_value($self, $_[2]));
-    return $self->{_xs}->cas(@_);
-}
+# See Fast.xs.
+
+
+=item C<cas_multi>
+
+  $memd->cas_multi(
+      [$key, $cas, $value],
+      [$key, $cas, $value, $expiration_time],
+      ...
+  );
+
+Like L</cas>, but operates on more than one key.  Takes the list of
+references to arrays each holding I<$key>, I<$cas>, I<$value> and
+optional I<$expiration_time>.
+
+Note that multi commands are not all-or-nothing, some operations may
+succeed, while others may fail.
+
+I<Return:> in list context returns the list of results, each
+I<$list[$index]> is the result value corresponding to the argument at
+position I<$index>.  In scalar context, hash reference is returned,
+where I<$href-E<gt>{$key}> hols the result value.  See L</cas> to
+learn what the result value is.
+
+B<cas> command first appeared in B<memcached> 1.2.4.
+
+=cut
+
+# See Fast.xs.
 
 
 =item C<add>
@@ -561,15 +590,38 @@ key B<doesn't> exists on the server.
 See L</set> for I<$key>, I<$value>, I<$expiration_time> parameters
 description.
 
-I<Return:> boolean, true if operation succeeded, false otherwise.
+I<Return:> boolean, true for positive server reply, false for negative
+server reply, or I<undef> in case of some error.
 
 =cut
 
-sub add {
-    my Cache::Memcached::Fast $self = shift;
-    splice(@_, 1, 1, _pack_value($self, $_[1]));
-    return $self->{_xs}->add(@_);
-}
+# See Fast.xs.
+
+
+=item C<add_multi>
+
+  $memd->add_multi(
+      [$key, $value],
+      [$key, $value, $expiration_time],
+      ...
+  );
+
+Like L</add>, but operates on more than one key.  Takes the list of
+references to arrays each holding I<$key>, I<$value> and optional
+I<$expiration_time>.
+
+Note that multi commands are not all-or-nothing, some operations may
+succeed, while others may fail.
+
+I<Return:> in list context returns the list of results, each
+I<$list[$index]> is the result value corresponding to the argument at
+position I<$index>.  In scalar context, hash reference is returned,
+where I<$href-E<gt>{$key}> hols the result value.  See L</add> to
+learn what the result value is.
+
+=cut
+
+# See Fast.xs.
 
 
 =item C<replace>
@@ -583,15 +635,38 @@ key B<does> exists on the server.
 See L</set> for I<$key>, I<$value>, I<$expiration_time> parameters
 description.
 
-I<Return:> boolean, true if operation succeeded, false otherwise.
+I<Return:> boolean, true for positive server reply, false for negative
+server reply, or I<undef> in case of some error.
 
 =cut
 
-sub replace {
-    my Cache::Memcached::Fast $self = shift;
-    splice(@_, 1, 1, _pack_value($self, $_[1]));
-    return $self->{_xs}->replace(@_);
-}
+# See Fast.xs.
+
+
+=item C<replace_multi>
+
+  $memd->replace_multi(
+      [$key, $value],
+      [$key, $value, $expiration_time],
+      ...
+  );
+
+Like L</replace>, but operates on more than one key.  Takes the list
+of references to arrays each holding I<$key>, I<$value> and optional
+I<$expiration_time>.
+
+Note that multi commands are not all-or-nothing, some operations may
+succeed, while others may fail.
+
+I<Return:> in list context returns the list of results, each
+I<$list[$index]> is the result value corresponding to the argument at
+position I<$index>.  In scalar context, hash reference is returned,
+where I<$href-E<gt>{$key}> hols the result value.  See L</replace> to
+learn what the result value is.
+
+=cut
+
+# See Fast.xs.
 
 
 =item C<append>
@@ -604,18 +679,40 @@ I<$key>.
 I<$key> and I<$value> should be scalars, as well as current value on
 the server.  C<append> doesn't affect expiration time of the value.
 
-I<Return:> boolean, true if operation succeeded, false otherwise.
+I<Return:> boolean, true for positive server reply, false for negative
+server reply, or I<undef> in case of some error.
 
-This command first appears in B<memcached> 1.2.4.
+B<append> command first appeared in B<memcached> 1.2.4.
 
 =cut
 
-sub append {
-    my Cache::Memcached::Fast $self = shift;
-    # append() does not affect flags.
-    splice(@_, 1, 1, \$_[1], 0);
-    return $self->{_xs}->append(@_);
-}
+# See Fast.xs.
+
+
+=item C<append_multi>
+
+  $memd->append_multi(
+      [$key, $value],
+      ...
+  );
+
+Like L</append>, but operates on more than one key.  Takes the list of
+references to arrays each holding I<$key>, I<$value>.
+
+Note that multi commands are not all-or-nothing, some operations may
+succeed, while others may fail.
+
+I<Return:> in list context returns the list of results, each
+I<$list[$index]> is the result value corresponding to the argument at
+position I<$index>.  In scalar context, hash reference is returned,
+where I<$href-E<gt>{$key}> hols the result value.  See L</append> to
+learn what the result value is.
+
+B<append> command first appeared in B<memcached> 1.2.4.
+
+=cut
+
+# See Fast.xs.
 
 
 =item C<prepend>
@@ -628,18 +725,40 @@ I<$key>.
 I<$key> and I<$value> should be scalars, as well as current value on
 the server.  C<prepend> doesn't affect expiration time of the value.
 
-I<Return:> boolean, true if operation succeeded, false otherwise.
+I<Return:> boolean, true for positive server reply, false for negative
+server reply, or I<undef> in case of some error.
 
-This command first appears in B<memcached> 1.2.4.
+B<prepend> command first appeared in B<memcached> 1.2.4.
 
 =cut
 
-sub prepend {
-    my Cache::Memcached::Fast $self = shift;
-    # prepend() does not affect flags.
-    splice(@_, 1, 1, \$_[1], 0);
-    return $self->{_xs}->prepend(@_);
-}
+# See Fast.xs.
+
+
+=item C<prepend_multi>
+
+  $memd->prepend_multi(
+      [$key, $value],
+      ...
+  );
+
+Like L</prepend>, but operates on more than one key.  Takes the list
+of references to arrays each holding I<$key>, I<$value>.
+
+Note that multi commands are not all-or-nothing, some operations may
+succeed, while others may fail.
+
+I<Return:> in list context returns the list of results, each
+I<$list[$index]> is the result value corresponding to the argument at
+position I<$index>.  In scalar context, hash reference is returned,
+where I<$href-E<gt>{$key}> hols the result value.  See L</prepend> to
+learn what the result value is.
+
+B<prepend> command first appeared in B<memcached> 1.2.4.
+
+=cut
+
+# See Fast.xs.
 
 
 =item C<get>
@@ -652,17 +771,7 @@ I<Return:> value associated with the I<$key>, or nothing.
 
 =cut
 
-sub get {
-    my Cache::Memcached::Fast $self = shift;
-
-    my ($val, $flags) = $self->{_xs}->get(@_);
-
-    if (defined $val and _unpack_value($self, $val, $flags)) {
-        return $$val;
-    } else {
-        return;
-    }
-}
+# See Fast.xs.
 
 
 =item C<get_multi>
@@ -677,23 +786,7 @@ corresponding value.
 
 =cut
 
-sub get_multi {
-    my Cache::Memcached::Fast $self = shift;
-
-    my ($key_val, $flags) = $self->{_xs}->mget(@_);
-
-    my $vi = 1;
-    foreach my $f (@$flags) {
-        if (_unpack_value($self, $$key_val[$vi], $f)) {
-            $$key_val[$vi] = ${$$key_val[$vi]};
-            $vi += 2;
-        } else {
-            splice(@$key_val, $vi - 1, 2);
-        }
-    }
-
-    return Cache::Memcached::Fast::_xs::_rvav2rvhv($key_val);
-}
+# See Fast.xs.
 
 
 =item C<gets>
@@ -713,22 +806,11 @@ may conveniently pass it back to L</cas> with I<@$res>:
       $memd->cas($key, @$cas_val);
   }
 
-This command first appears in B<memcached> 1.2.4.
+B<gets> command first appeared in B<memcached> 1.2.4.
 
 =cut
 
-sub gets {
-    my Cache::Memcached::Fast $self = shift;
-
-    my ($val, $flags) = $self->{_xs}->gets(@_);
-
-    if (defined $val and _unpack_value($self, $$val[1], $flags)) {
-        $$val[1] = ${$$val[1]};
-        return $val;
-    } else {
-        return;
-    }
-}
+# See Fast.xs.
 
 
 =item C<gets_multi>
@@ -741,27 +823,11 @@ I<@keys> should be an array of scalars.
 I<Return:> reference to hash, where I<$href-E<gt>{$key}> holds a
 reference to an array I<[$cas, $value]>.  Compare with L</gets>.
 
-This command first appears in B<memcached> 1.2.4.
+B<gets> command first appeared in B<memcached> 1.2.4.
 
 =cut
 
-sub gets_multi {
-    my Cache::Memcached::Fast $self = shift;
-
-    my ($key_val, $flags) = $self->{_xs}->mgets(@_);
-
-    my $vi = 1;
-    foreach my $f (@$flags) {
-        if (_unpack_value($self, ${$$key_val[$vi]}[1], $f)) {
-            ${$$key_val[$vi]}[1] = ${${$$key_val[$vi]}[1]};
-            $vi += 2;
-        } else {
-            splice(@$key_val, $vi - 1, 2);
-        }
-    }
-
-    return Cache::Memcached::Fast::_xs::_rvav2rvhv($key_val);
-}
+# See Fast.xs.
 
 
 =item C<incr>
@@ -774,14 +840,39 @@ number, zero is assumed.  An optional I<$increment> should be a
 positive integer, when not given 1 is assumed.  Note that the server
 doesn't check for overflow.
 
-I<Return:> unsigned integer, new value for the I<$key>, or nothing.
+I<Return:> unsigned integer, new value for the I<$key>, or false for
+negative server reply, or I<undef> in case of some error.
 
 =cut
 
-sub incr {
-    my Cache::Memcached::Fast $self = shift;
-    return $self->{_xs}->incr(@_);
-}
+# See Fast.xs.
+
+
+=item C<incr_multi>
+
+  $memd->incr_multi(
+      @keys,
+      [$key],
+      [$key, $increment],
+      ...
+  );
+
+Like L</incr>, but operates on more than one key.  Takes the list of
+keys and references to arrays each holding I<$key> and optional
+I<$increment>.
+
+Note that multi commands are not all-or-nothing, some operations may
+succeed, while others may fail.
+
+I<Return:> in list context returns the list of results, each
+I<$list[$index]> is the result value corresponding to the argument at
+position I<$index>.  In scalar context, hash reference is returned,
+where I<$href-E<gt>{$key}> hols the result value.  See L</incr> to
+learn what the result value is.
+
+=cut
+
+# See Fast.xs.
 
 
 =item C<decr>
@@ -793,19 +884,45 @@ Decrement the value for the I<$key>.  If current value is not a
 number, zero is assumed.  An optional I<$decrement> should be a
 positive integer, when not given 1 is assumed.  Note that the server
 I<does> check for underflow, attempt to decrement the value below zero
-would set the value to zero.
+would set the value to zero.  Similar to L<DBI|DBI>, zero is returned
+as "0E0", and evaluates to true in a boolean context.
 
-I<Return:> unsigned integer, new value for the I<$key>, or nothing.
+I<Return:> unsigned integer, new value for the I<$key>, or false for
+negative server reply, or I<undef> in case of some error.
 
 =cut
 
-sub decr {
-    my Cache::Memcached::Fast $self = shift;
-    return $self->{_xs}->decr(@_);
-}
+# See Fast.xs.
 
 
-=item C<delete> (or deprecated C<remove>)
+=item C<decr_multi>
+
+  $memd->decr_multi(
+      @keys,
+      [$key],
+      [$key, $decrement],
+      ...
+  );
+
+Like L</decr>, but operates on more than one key.  Takes the list of
+keys and references to arrays each holding I<$key> and optional
+I<$decrement>.
+
+Note that multi commands are not all-or-nothing, some operations may
+succeed, while others may fail.
+
+I<Return:> in list context returns the list of results, each
+I<$list[$index]> is the result value corresponding to the argument at
+position I<$index>.  In scalar context, hash reference is returned,
+where I<$href-E<gt>{$key}> hols the result value.  See L</decr> to
+learn what the result value is.
+
+=cut
+
+# See Fast.xs.
+
+
+=item C<delete>
 
   $memd->delete($key);
   $memd->delete($key, $delay);
@@ -815,16 +932,48 @@ non-negative integer number of seconds to delay the operation.  During
 this time L</add> and L</replace> commands will be rejected by the
 server.  When omitted, zero is assumed, i.e. delete immediately.
 
-I<Return:> boolean, true if operation succeeded, false otherwise.
+I<Return:> boolean, true for positive server reply, false for negative
+server reply, or I<undef> in case of some error.
 
 =cut
 
-# remove is still loaded via AUTOLOAD, if we mention is here we'll
-# have to document it as a separate =item.
-sub delete {
-    my Cache::Memcached::Fast $self = shift;
-    return $self->{_xs}->delete(@_);
-}
+# See Fast.xs.
+
+
+=item C<remove> (B<deprecated>)
+
+Alias for L</delete>, for compatibility with B<Cache::Memcached>.
+
+=cut
+
+*remove = \&delete;
+
+
+=item C<delete_multi>
+
+  $memd->delete_multi(
+      @keys,
+      [$key],
+      [$key, $delay],
+      ...
+  );
+
+Like L</delete>, but operates on more than one key.  Takes the list of
+keys and references to arrays each holding I<$key> and optional
+I<$delay>.
+
+Note that multi commands are not all-or-nothing, some operations may
+succeed, while others may fail.
+
+I<Return:> in list context returns the list of results, each
+I<$list[$index]> is the result value corresponding to the argument at
+position I<$index>.  In scalar context, hash reference is returned,
+where I<$href-E<gt>{$key}> hols the result value.  See L</delete> to
+learn what the result value is.
+
+=cut
+
+# See Fast.xs.
 
 
 =item C<flush_all>
@@ -839,23 +988,53 @@ have three servers, and call C<flush_all(30)>, the servers would get
 30, 15, 0 seconds delays respectively.  When omitted, zero is assumed,
 i.e. flush immediately.
 
-I<Return:> boolean, true if operation succeeded, false otherwise.
+I<Return:> reference to hash, where I<$href-E<gt>{$server}> holds
+corresponding result value.  I<$server> is either I<host:port> or
+F</path/to/unix.sock>, as described in L</servers>.  Result value is a
+boolean, true for positive server reply, false for negative server
+reply, or I<undef> in case of some error.
 
 =cut
 
-sub flush_all {
-    my Cache::Memcached::Fast $self = shift;
-    return $self->{_xs}->flush_all(@_);
-}
+# See Fast.xs.
 
 
-# AOUTOLOAD is used for commands that are not yet official and
-# documented.
-sub AUTOLOAD {
-    my Cache::Memcached::Fast $self = shift;
-    my ($method) = $AUTOLOAD =~ /::([^:]+)$/;
-    return $self->{_xs}->$method(@_);
-}
+=item C<nowait_push>
+
+  $memd->nowait_push;
+
+Push all pending requests to the server(s), and wait for all replies.
+When L</nowait> mode is enabled, the requests issued in a void context
+may not reach the server(s) immediately (because the reply is not
+waited for).  Instead they may stay in the send queue on the local
+host, or in the receive queue on the remote host(s), for quite a long
+time.  This method ensures that they are delivered to the server(s),
+processed there, and the replies have arrived (or some error has
+happened that caused some connection(s) to be closed).
+
+Destructor will call this method to ensure that all requests are
+processed before the connection is closed.
+
+I<Return:> nothing.
+
+=cut
+
+# See Fast.xs.
+
+
+=item C<server_versions>
+
+  $memd->server_versions;
+
+Get server versions.
+
+I<Return:> reference to hash, where I<$href-E<gt>{$server}> holds
+corresponding server version.  I<$server> is either I<host:port> or
+F</path/to/unix.sock>, as described in L</servers>.
+
+=cut
+
+# See Fast.xs.
 
 
 1;
@@ -891,6 +1070,13 @@ of them will never be):
 
 Current implementation never rehashes keys, instead L</max_failures>
 and L</failure_timeout> are used.
+
+If the client would rehash the keys, a consistency problem would
+arise: when the failure occurs the client can't tell whether the
+server is down, or there's a (transient) network failure.  While some
+clients might fail to reach a particular server, others may still
+reach it, so some clients will start rehashing, while others will not,
+and they will no longer agree which key goes where.
 
 
 =item I<readonly>
@@ -964,15 +1150,11 @@ or
 =back
 
 
-=head1 UTF-8 and tainted data
+=head1 Tainted data
 
-Current implementation does not preserve UTF-8 flag on scalars.
-Storing UTF-8 string and retrieving it back would return the same byte
-sequence, but UTF-8 flag will be forgotten.  See L<utf8|utf8>.
-
-Likewise, tainted flag is neither tested nor preserved, storing
-tainted data and retrieving it back would clear tainted flag.  See
-L<perlsec|perlsec>.
+In current implementation tainted flag is neither tested nor
+preserved, storing tainted data and retrieving it back would clear
+tainted flag.  See L<perlsec|perlsec>.
 
 
 =head1 BUGS
@@ -995,6 +1177,11 @@ You can find documentation for this module with the perldoc command.
 You can also look for information at:
 
 =over 4
+
+=item * Project home
+
+L<http://openhack.ru/Cache-Memcached-Fast>
+
 
 =item * RT: CPAN's request tracker
 
@@ -1040,6 +1227,8 @@ management, design suggestions, testing.
 
 Development of this module is sponsored by S<Monashev Co. Ltd.>
 
+Thanks to Peter J. Holzer for enlightening on UTF-8 support.
+
 
 =head1 WARRANTY
 
@@ -1049,7 +1238,7 @@ There's B<NONE>, neither explicit nor implied.  But you knew it already
 
 =head1 COPYRIGHT AND LICENSE
 
-Copyright (C) 2007 Tomash Brechko.  All rights reserved.
+Copyright (C) 2007-2008 Tomash Brechko.  All rights reserved.
 
 This library is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself, either Perl version 5.8.8 or,

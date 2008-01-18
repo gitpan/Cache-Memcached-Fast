@@ -1,5 +1,5 @@
 /*
-  Copyright (C) 2007 Tomash Brechko.  All rights reserved.
+  Copyright (C) 2007-2008 Tomash Brechko.  All rights reserved.
 
   When used to build Perl module:
 
@@ -22,6 +22,7 @@
 */
 
 #include "client.h"
+#include "array.h"
 #include "connect.h"
 #include "parse_keyword.h"
 #include "dispatch_key.h"
@@ -44,7 +45,7 @@
 
 
 /* REPLY_BUF_SIZE should be large enough to contain first reply line.  */
-#define REPLY_BUF_SIZE  1024
+#define REPLY_BUF_SIZE  1536
 
 
 #define FLAGS_STUB  "4294967295"
@@ -64,59 +65,18 @@ typedef unsigned long long generation_type;
 
 struct value_state
 {
-  struct value_object *object;
   void *opaque;
-  flags_type flags;
   void *ptr;
   value_size_type size;
-  int use_cas;
-  cas_type cas;
+  struct meta_object meta;
 };
-
-
-static inline
-void
-value_state_reset(struct value_state *state, struct value_object *o,
-                  int use_cas)
-{
-  state->object = o;
-  state->use_cas = use_cas;
-
-#if 0 /* No need to initialize the following.  */
-  state->ptr = NULL;
-  state->size = 0;
-#endif
-}
-
-
-struct arith_state
-{
-  arith_type *result;
-};
-
-
-static inline
-void
-arith_state_reset(struct arith_state *state, arith_type *result)
-{
-  state->result = result;
-}
 
 
 struct embedded_state
 {
-  struct value_object *object;
-
+  void *opaque;
   void *ptr;
 };
-
-
-static inline
-void
-embedded_state_reset(struct embedded_state *state, struct value_object *o)
-{
-  state->object = o;
-}
 
 
 struct command_state;
@@ -125,7 +85,6 @@ typedef int (*parse_reply_func)(struct command_state *state);
 
 enum command_phase
 {
-  PHASE_INIT,
   PHASE_RECEIVE,
   PHASE_PARSE,
   PHASE_VALUE,
@@ -141,19 +100,16 @@ struct command_state
   struct client *client;
   int fd;
   int noreply;
+  int last_cmd_noreply;
 
-  /*
-    If the command needs additional character buffer, the space after
-    the last struct iovec is used.  Hence iov_buf_size may be not
-    multiple of sizeof(struct iovec).
-  */
-  struct iovec *iov_buf;
-  size_t iov_buf_size;
+  struct array iov_buf;
+  int str_step;
 
   generation_type generation;
 
   int phase;
   int nowait_count;
+  int reply_count;
 
   char *buf;
   char *pos;
@@ -164,38 +120,44 @@ struct command_state
   struct iovec *iov;
   int iov_count;
   int write_offset;
-  int key_offset;
   struct iovec *key;
   int key_count;
-  int key_index;
-  int key_head;
-  int key_tail;
+  int index;
+  int index_head;
+  int index_tail;
 
   parse_reply_func parse_reply;
+  struct result_object *object;
 
   union
   {
     struct value_state value;
-    struct arith_state arith;
     struct embedded_state embedded;
   } u;
 };
 
 
 static inline
-void
+int
 command_state_init(struct command_state *state,
                    struct client *c, int noreply)
 {
   state->client = c;
   state->fd = -1;
   state->noreply = noreply;
-  state->iov_buf = NULL;
-  state->iov_buf_size = 0;
+  state->last_cmd_noreply = 0;
+
+  array_init(&state->iov_buf);
+
   state->generation = 0;
   state->nowait_count = 0;
   state->buf = (char *) malloc(REPLY_BUF_SIZE);
+  if (! state->buf)
+    return -1;
+
   state->pos = state->end = state->eol = state->buf;
+
+  return 0;
 }
 
 
@@ -204,7 +166,9 @@ void
 command_state_destroy(struct command_state *state)
 {
   free(state->buf);
-  free(state->iov_buf);
+
+  array_destroy(&state->iov_buf);
+
   if (state->fd != -1)
     close(state->fd);
 }
@@ -253,7 +217,8 @@ server_init(struct server *s, struct client *c,
   s->failure_count = 0;
   s->failure_expires = 0;
 
-  command_state_init(&s->cmd_state, c, noreply);
+  if (command_state_init(&s->cmd_state, c, noreply) != 0)
+    return MEMCACHED_FAILURE;
 
   return MEMCACHED_SUCCESS;
 }
@@ -268,25 +233,22 @@ server_destroy(struct server *s)
 }
 
 
-struct key_node
+struct index_node
 {
-  int key;
+  int index;
   int next;
 };
 
 
 struct client
 {
-  struct server *servers;
-  int server_count;
-  int server_capacity;
+  struct array servers;
 
   struct dispatch_state dispatch;
 
   char *prefix;
   size_t prefix_len;
 
-  int key_step;
   int connect_timeout;          /* 1/1000 sec.  */
   int io_timeout;               /* 1/1000 sec.  */
   int max_failures;
@@ -294,9 +256,8 @@ struct client
   int close_on_error;
   int nowait;
 
-  struct key_node *key_list;
-  int key_list_count;
-  int key_list_capacity;
+  struct array index_list;
+  struct array str_buf;
 
   generation_type generation;
 };
@@ -304,28 +265,28 @@ struct client
 
 static inline
 void
-command_state_reset(struct command_state *state, int key_offset,
-                    int key_count, parse_reply_func parse_reply)
+command_state_reset(struct command_state *state, int str_step,
+                    parse_reply_func parse_reply)
 {
-  state->key_offset = key_offset;
-  state->key_count = key_count;
+  state->reply_count = 0;
+  state->str_step = str_step;
+  state->key_count = 0;
   state->parse_reply = parse_reply;
 
-  state->phase = PHASE_INIT;
+  state->phase = PHASE_RECEIVE;
 
-  if (! parse_reply && ! state->noreply)
-    ++state->nowait_count;
+  array_clear(state->iov_buf);
 
-  state->iov = state->iov_buf;
   state->write_offset = 0;
-  state->key_head = state->key_tail = -1;
-  state->iov_count = 0;
+  state->index_head = state->index_tail = -1;
   state->generation = state->client->generation;
 
 #if 0 /* No need to initialize the following.  */
   state->key = NULL;
-  state->key_index = 0;
+  state->index = 0;
   state->match = NO_MATCH;
+  state->iov_count = 0;
+  state->iov = NULL;
 #endif
 }
 
@@ -348,17 +309,21 @@ deactivate(struct command_state *state)
 
 static inline
 int
-get_key_index(struct command_state *state)
+get_index(struct command_state *state)
 {
-  return state->client->key_list[state->key_head].key;
+  struct index_node *node = array_elem(state->client->index_list,
+                                       struct index_node, state->index_head);
+  return node->index;
 }
 
 
 static inline
 void
-next_key_index(struct command_state *state)
+next_index(struct command_state *state)
 {
-  state->key_head = state->client->key_list[state->key_head].next;
+  struct index_node *node = array_elem(state->client->index_list,
+                                       struct index_node, state->index_head);
+  state->index_head = node->next;
 }
 
 
@@ -369,24 +334,20 @@ client_init()
   if (! c)
     return NULL;
 
-  c->servers = NULL;
-  c->server_count = c->server_capacity = 0;
+  array_init(&c->servers);
+  array_init(&c->index_list);
+  array_init(&c->str_buf);
 
   dispatch_init(&c->dispatch);
 
   c->connect_timeout = 250;
   c->io_timeout = 1000;
-  c->prefix = NULL;
-  c->prefix_len = 0;
-  /* Keys are interleaved with spaces.  */
-  c->key_step = 2;
+  c->prefix = " ";
+  c->prefix_len = 1;
   c->max_failures = 0;
   c->failure_timeout = 10;
   c->close_on_error = 1;
   c->nowait = 0;
-
-  c->key_list = NULL;
-  c->key_list_count = c->key_list_capacity = 0;
 
   c->generation = 1;            /* Different from initial command state.  */
 
@@ -394,19 +355,30 @@ client_init()
 }
 
 
+static
+int
+client_noreply_push(struct client *c);
+
+
 void
 client_destroy(struct client *c)
 {
-  int i;
+  struct server *s;
 
-  for (i = 0; i < c->server_count; ++i)
-    server_destroy(&c->servers[i]);
+  client_nowait_push(c);
+  client_noreply_push(c);
+
+  for (array_each(c->servers, struct server, s))
+    server_destroy(s);
 
   dispatch_destroy(&c->dispatch);
 
-  free(c->servers);
-  free(c->prefix);
-  free(c->key_list);
+  array_destroy(&c->servers);
+  array_destroy(&c->index_list);
+  array_destroy(&c->str_buf);
+
+  if (c->prefix_len > 1)
+    free(c->prefix);
   free(c);
 }
 
@@ -415,7 +387,7 @@ int
 client_set_ketama_points(struct client *c, int ketama_points)
 {
   /* Should be called before we added any server.  */
-  if (c->server_count > 0 || ketama_points < 0)
+  if (! array_empty(c->servers) || ketama_points < 0)
     return MEMCACHED_FAILURE;
 
   dispatch_set_ketama_points(&c->dispatch, ketama_points);
@@ -476,30 +448,20 @@ client_add_server(struct client *c, const char *host, size_t host_len,
   if (weight <= 0.0)
     return MEMCACHED_FAILURE;
 
-  if (c->server_count == c->server_capacity)
-    {
-      int capacity = (c->server_capacity > 0 ? c->server_capacity + 1 : 1);
-      struct server *s =
-        (struct server *) realloc(c->servers,
-                                  capacity * sizeof(struct server));
-      if (! s)
-        return MEMCACHED_FAILURE;
+  if (array_extend(c->servers, struct server, 1, ARRAY_EXTEND_EXACT) == -1)
+    return MEMCACHED_FAILURE;
 
-      c->servers = s;
-      c->server_capacity = capacity;
-    }
-
-  res = server_init(&c->servers[c->server_count], c,
+  res = server_init(array_end(c->servers, struct server), c,
                     host, host_len, port, port_len, noreply);
   if (res != MEMCACHED_SUCCESS)
     return res;
 
   res = dispatch_add_server(&c->dispatch, host, host_len, port, port_len,
-                            weight, c->server_count);
+                            weight, array_size(c->servers));
   if (res == -1)
     return MEMCACHED_FAILURE;
 
-  ++c->server_count;
+  array_push(c->servers);
 
   return MEMCACHED_SUCCESS;
 }
@@ -512,26 +474,27 @@ client_set_prefix(struct client *c, const char *ns, size_t ns_len)
 
   if (ns_len == 0)
     {
-      free(c->prefix);
-      c->prefix = NULL;
-      c->prefix_len = 0;
-      /* Keys are interleaved with spaces.  */
-      c->key_step = 2;
+      if (c->prefix_len > 1)
+        {
+          free(c->prefix);
+          c->prefix = " ";
+          c->prefix_len = 1;
+        }
       return MEMCACHED_SUCCESS;
     }
 
-  s = (char *) realloc(c->prefix, ns_len + 1);
+  if (c->prefix_len == 1)
+    c->prefix = NULL;
+  s = (char *) realloc(c->prefix, 1 + ns_len + 1);
   if (! s)
     return MEMCACHED_FAILURE;
 
-  /* Keys are interleaved with spaces and prefix.  */
-  c->key_step = 3;
-
-  memcpy(s, ns, ns_len);
-  s[ns_len] = '\0';
+  s[0] = ' ';
+  memcpy(s + 1, ns, ns_len);
+  s[ns_len + 1] = '\0';
 
   c->prefix = s;
-  c->prefix_len = ns_len;
+  c->prefix_len = 1 + ns_len;
 
   return MEMCACHED_SUCCESS;
 }
@@ -613,7 +576,7 @@ parse_key(struct command_state *state)
   char *key_pos;
 
   /* Skip over the prefix.  */
-  state->pos += state->client->prefix_len;
+  state->pos += state->client->prefix_len - 1;
 
   key_pos = (char *) state->key->iov_base;
   while (state->key_count > 1)
@@ -639,8 +602,8 @@ parse_key(struct command_state *state)
       */
       do
         {
-          next_key_index(state);
-          state->key += state->client->key_step;
+          next_index(state);
+          state->key += 2;
         }
       while (--state->key_count > 1
              && (state->key->iov_len < prefix_len
@@ -657,9 +620,9 @@ parse_key(struct command_state *state)
     }
 
   --state->key_count;
-  state->key += state->client->key_step;
-  state->key_index = get_key_index(state);
-  next_key_index(state);
+  state->key += 2;
+  state->index = get_index(state);
+  next_index(state);
 
   return MEMCACHED_SUCCESS;
 }
@@ -711,7 +674,7 @@ read_value(struct command_state *state)
               if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
                 return MEMCACHED_EAGAIN;
 
-              state->u.value.object->free(state->u.value.opaque);
+              state->object->free(state->u.value.opaque);
               return MEMCACHED_CLOSED;
             }
 
@@ -733,16 +696,14 @@ read_value(struct command_state *state)
 
   if (memcmp(state->pos, eol, sizeof(eol)) != 0)
     {
-      state->u.value.object->free(state->u.value.opaque);
+      state->object->free(state->u.value.opaque);
       return MEMCACHED_UNKNOWN;
     }
   state->pos += sizeof(eol);
   state->eol = state->pos;
 
-  state->u.value.object->store(state->u.value.object->arg,
-                               state->u.value.opaque,
-                               state->key_index, state->u.value.flags,
-                               state->u.value.use_cas, state->u.value.cas);
+  state->object->store(state->object->arg, state->u.value.opaque,
+                       state->index, &state->u.value.meta);
 
   return MEMCACHED_SUCCESS;
 }
@@ -823,28 +784,27 @@ parse_get_reply(struct command_state *state)
   res = parse_ull(state, &num);
   if (res != MEMCACHED_SUCCESS)
     return res;
-  state->u.value.flags = num;
+  state->u.value.meta.flags = num;
 
   res = parse_ull(state, &num);
   if (res != MEMCACHED_SUCCESS)
     return res;
   state->u.value.size = num;
 
-  if (state->u.value.use_cas)
+  if (state->u.value.meta.use_cas)
     {
       res = parse_ull(state, &num);
       if (res != MEMCACHED_SUCCESS)
         return res;
-      state->u.value.cas = num;
+      state->u.value.meta.cas = num;
     }
 
   res = swallow_eol(state, 0, 0);
   if (res != MEMCACHED_SUCCESS)
     return res;
 
-  state->u.value.ptr =
-    state->u.value.object->alloc(state->u.value.size,
-                                 &state->u.value.opaque);
+  state->u.value.ptr = state->object->alloc(state->u.value.size,
+                                            &state->u.value.opaque);
   if (! state->u.value.ptr)
     return MEMCACHED_FAILURE;
 
@@ -854,27 +814,37 @@ parse_get_reply(struct command_state *state)
 }
 
 
+static inline
+void
+store_result(struct command_state *state, int res)
+{
+  int index = get_index(state);
+  next_index(state);
+  state->object->store(state->object->arg, (void *) res, index, NULL);
+}
+
+
 static
 int
 parse_set_reply(struct command_state *state)
 {
-  int res;
-
   switch (state->match)
     {
     case MATCH_STORED:
-      return swallow_eol(state, 0, 1);
+      store_result(state, 1);
+      break;
 
     case MATCH_NOT_STORED:
     case MATCH_NOT_FOUND:
     case MATCH_EXISTS:
-      res = swallow_eol(state, 0, 1);
-
-      return (res == MEMCACHED_SUCCESS ? MEMCACHED_FAILURE : res);
+      store_result(state, 0);
+      break;
 
     default:
       return MEMCACHED_UNKNOWN;
     }
+
+  return swallow_eol(state, 0, 1);
 }
 
 
@@ -882,21 +852,21 @@ static
 int
 parse_delete_reply(struct command_state *state)
 {
-  int res;
-
   switch (state->match)
     {
     case MATCH_DELETED:
-      return swallow_eol(state, 0, 1);
+      store_result(state, 1);
+      break;
 
     case MATCH_NOT_FOUND:
-      res = swallow_eol(state, 0, 1);
-
-      return (res == MEMCACHED_SUCCESS ? MEMCACHED_FAILURE : res);
+      store_result(state, 0);
+      break;
 
     default:
       return MEMCACHED_UNKNOWN;
     }
+
+  return swallow_eol(state, 0, 1);
 }
 
 
@@ -904,15 +874,26 @@ static
 int
 parse_arith_reply(struct command_state *state)
 {
-  unsigned long long num;
-  int res;
+  char *beg;
+  size_t len;
+  int zero;
+
+  state->index = get_index(state);
+  next_index(state);
 
   switch (state->match)
     {
     case MATCH_NOT_FOUND:
-      res = swallow_eol(state, 0, 1);
+      /* On NOT_FOUND we store the defined empty string.  */
+      state->u.embedded.ptr =
+        state->object->alloc(0, &state->u.embedded.opaque);
+      if (! state->u.embedded.ptr)
+        return MEMCACHED_FAILURE;
 
-      return (res == MEMCACHED_SUCCESS ? MEMCACHED_FAILURE : res);
+      state->object->store(state->object->arg, state->u.embedded.opaque,
+                           state->index, NULL);
+
+      return swallow_eol(state, 0, 1);
 
     default:
       return MEMCACHED_UNKNOWN;
@@ -922,19 +903,41 @@ parse_arith_reply(struct command_state *state)
       break;
     }
 
-  --state->pos;
+  beg = state->pos - 1;
+  len = 0;
+  while (len == 0)
+    {
+      switch (*state->pos)
+        {
+        case '0': case '1': case '2': case '3': case '4':
+        case '5': case '6': case '7': case '8': case '9':
+          ++state->pos;
+          break;
 
-  res = parse_ull(state, &num);
-  if (res != MEMCACHED_SUCCESS)
-    return res;
-  *state->u.arith.result = num;
+        default:
+          len = state->pos - beg;
+          break;
+        }
+    }
+
+  zero = (*beg == '0' && len == 1);
+  if (zero)
+    len = 3;
+
+  state->u.embedded.ptr = state->object->alloc(len, &state->u.embedded.opaque);
+  if (! state->u.embedded.ptr)
+    return MEMCACHED_FAILURE;
+
+  if (! zero)
+    memcpy(state->u.embedded.ptr, beg, len);
+  else
+    memcpy(state->u.embedded.ptr, "0E0", 3);
+
+  state->object->store(state->object->arg, state->u.embedded.opaque,
+                       state->index, NULL);
 
   /* Value may be space padded.  */
-  res = swallow_eol(state, 1, 1);
-  if (res != MEMCACHED_SUCCESS)
-    return res;
-
-  return MEMCACHED_SUCCESS;
+  return swallow_eol(state, 1, 1);
 }
 
 
@@ -945,6 +948,7 @@ parse_ok_reply(struct command_state *state)
   switch (state->match)
     {
     case MATCH_OK:
+      store_result(state, 1);
       return swallow_eol(state, 0, 1);
 
     default:
@@ -960,6 +964,9 @@ parse_version_reply(struct command_state *state)
   const char *beg;
   size_t len;
   int res;
+
+  state->index = get_index(state);
+  next_index(state);
 
   switch (state->match)
     {
@@ -981,12 +988,14 @@ parse_version_reply(struct command_state *state)
 
   len = state->pos - sizeof(eol) - beg;
 
-  state->u.embedded.ptr =
-    state->u.embedded.object->alloc(len, &state->u.embedded.object->arg);
+  state->u.embedded.ptr = state->object->alloc(len, &state->u.embedded.opaque);
   if (! state->u.embedded.ptr)
     return MEMCACHED_FAILURE;
 
   memcpy(state->u.embedded.ptr, beg, len);
+
+  state->object->store(state->object->arg, state->u.embedded.opaque,
+                       state->index, NULL);
 
   return MEMCACHED_SUCCESS;
 }
@@ -996,12 +1005,7 @@ static
 int
 parse_nowait_reply(struct command_state *state)
 {
-  int done, res;
-
-  --state->nowait_count;
-  done = (state->nowait_count == 0 && ! state->parse_reply);
-  if (! done)
-    state->phase = PHASE_RECEIVE;
+  int res;
 
   /*
     Cast to enum parse_keyword_e to get compiler warning when some
@@ -1012,31 +1016,28 @@ parse_nowait_reply(struct command_state *state)
     case MATCH_DELETED:
     case MATCH_OK:
     case MATCH_STORED:
-      return swallow_eol(state, 0, done);
-
-    case MATCH_0: case MATCH_1: case MATCH_2: case MATCH_3: case MATCH_4:
-    case MATCH_5: case MATCH_6: case MATCH_7: case MATCH_8: case MATCH_9:
-      return swallow_eol(state, 1, done);
-
     case MATCH_EXISTS:
     case MATCH_NOT_FOUND:
     case MATCH_NOT_STORED:
-      res = swallow_eol(state, 0, done);
-      return (res == MEMCACHED_SUCCESS ? MEMCACHED_FAILURE : res);
+      return swallow_eol(state, 0, 1);
+
+    case MATCH_0: case MATCH_1: case MATCH_2: case MATCH_3: case MATCH_4:
+    case MATCH_5: case MATCH_6: case MATCH_7: case MATCH_8: case MATCH_9:
+    case MATCH_VERSION: /* see client_noreply_push().  */
+      return swallow_eol(state, 1, 1);
 
     case MATCH_ERROR:
-      res = swallow_eol(state, 0, done);
+      res = swallow_eol(state, 0, 1);
       return (res == MEMCACHED_SUCCESS ? MEMCACHED_ERROR : res);
 
     case MATCH_CLIENT_ERROR:
     case MATCH_SERVER_ERROR:
-      res = swallow_eol(state, 1, done);
+      res = swallow_eol(state, 1, 1);
       return (res == MEMCACHED_SUCCESS ? MEMCACHED_ERROR : res);
 
     case NO_MATCH:
     case MATCH_VALUE:
     case MATCH_END:
-    case MATCH_VERSION:
     case MATCH_STAT:
       return MEMCACHED_UNKNOWN;
     }
@@ -1047,8 +1048,41 @@ parse_nowait_reply(struct command_state *state)
 
 
 static
+void
+client_mark_failed(struct client *c, struct server *s)
+{
+  if (s->cmd_state.fd != -1)
+    {
+      close(s->cmd_state.fd);
+      s->cmd_state.fd = -1;
+      s->cmd_state.nowait_count = 0;
+      s->cmd_state.pos = s->cmd_state.end = s->cmd_state.eol =
+        s->cmd_state.buf;
+    }
+
+  if (c->max_failures > 0)
+    {
+      time_t now = time(NULL);
+      if (s->failure_expires < now)
+        s->failure_count = 0;
+      ++s->failure_count;
+      /*
+        Set timeout on first failure, and on max_failures.  The idea
+        is that if max_failures had happened during failure_timeout,
+        we do not retry in another failure_timeout seconds.  This is
+        not entirely true: we remember the time of the first failure,
+        but for exact accounting we would have to keep time of each
+        failure.  However such exact measurement is not necessary.
+      */
+      if (s->failure_count == 1 || s->failure_count == c->max_failures)
+        s->failure_expires = now + c->failure_timeout;
+    }
+}
+
+
+static
 int
-send_request(struct command_state *state)
+send_request(struct command_state *state, struct server *s)
 {
   while (state->iov_count > 0)
     {
@@ -1073,7 +1107,12 @@ send_request(struct command_state *state)
       if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
         return MEMCACHED_EAGAIN;
       if (res <= 0)
-        return MEMCACHED_CLOSED;
+        {
+          deactivate(state);
+          client_mark_failed(state->client, s);
+
+          return MEMCACHED_CLOSED;
+        }
 
       while ((size_t) res >= len)
         {
@@ -1087,6 +1126,9 @@ send_request(struct command_state *state)
       state->write_offset += res;
     }
 
+  if (state->reply_count == 0)
+    deactivate(state);
+
   return MEMCACHED_SUCCESS;
 }
 
@@ -1098,17 +1140,17 @@ receive_reply(struct command_state *state)
   while (state->eol != state->end && *state->eol != eol[sizeof(eol) - 1])
     ++state->eol;
 
+  /*
+    When buffer is empty, move to the beginning of it for better CPU
+    cache utilization.
+  */
+  if (state->pos == state->end)
+    state->pos = state->end = state->eol = state->buf;
+
   while (state->eol == state->end)
     {
       size_t size;
       ssize_t res;
-
-      /*
-        When buffer is empty, move to the beginning of it for better
-        CPU cache utilization.
-      */
-      if (state->pos == state->end)
-        state->pos = state->end = state->eol = state->buf;
 
       size = REPLY_BUF_SIZE - (state->end - state->buf);
       if (size == 0)
@@ -1119,7 +1161,7 @@ receive_reply(struct command_state *state)
               state->pos = memmove(state->buf, state->pos, len);
               state->end -= REPLY_BUF_SIZE - len;
               state->eol -= REPLY_BUF_SIZE - len;
-              continue;
+              size = REPLY_BUF_SIZE - len;
             }
           else
             {
@@ -1179,25 +1221,18 @@ parse_reply(struct command_state *state)
 
 static
 int
-process_reply(struct command_state *state)
+process_reply(struct command_state *state, struct server *s)
 {
-  int res;
+  int res = 0;
 
   while (1)
     {
       switch (state->phase)
         {
-        case PHASE_INIT:
-          state->key = &state->iov_buf[state->key_offset];
-
-          state->phase = PHASE_RECEIVE;
-
-          /* Fall into below.  */
-
         case PHASE_RECEIVE:
           res = receive_reply(state);
           if (res != MEMCACHED_SUCCESS)
-            return res;
+            break;
 
           state->match = parse_keyword(&state->pos);
 
@@ -1208,74 +1243,96 @@ process_reply(struct command_state *state)
         case PHASE_PARSE:
           res = parse_reply(state);
           if (res != MEMCACHED_SUCCESS)
-            return res;
+            break;
 
           if (state->phase != PHASE_DONE)
-            break;
+            continue;
 
           /* Fall into below.  */
 
         case PHASE_DONE:
-          if (state->pos != state->end)
-            return MEMCACHED_UNKNOWN;
+          res = MEMCACHED_SUCCESS;
 
-          return MEMCACHED_SUCCESS;
+          break;
 
         case PHASE_VALUE:
           res = read_value(state);
           if (res != MEMCACHED_SUCCESS)
-            return res;
+            break;
 
           state->phase = PHASE_RECEIVE;
+          continue;
+        }
 
-          break;
+      switch (res)
+        {
+        case MEMCACHED_ERROR:
+          if (! (state->client->close_on_error || state->noreply))
+            break;
+
+          /* else fall into below.  */
+
+        case MEMCACHED_UNKNOWN:
+        case MEMCACHED_CLOSED:
+          deactivate(state);
+          client_mark_failed(state->client, s);
+
+          /* Fall into below.  */
+
+        case MEMCACHED_EAGAIN:
+          return res;
+        }
+
+      if (state->nowait_count > 0)
+        {
+          --state->nowait_count;
+        }
+      else if (--state->reply_count == 0)
+        {
+          if (state->iov_count == 0)
+            deactivate(state);
+
+          return res;
+        }
+
+      state->phase = PHASE_RECEIVE;
+    }
+}
+
+
+static inline
+void
+state_prepare(struct command_state *state)
+{
+  state->key = array_elem(state->iov_buf, struct iovec, 2);
+  state->iov = array_beg(state->iov_buf, struct iovec);
+  state->iov_count = array_size(state->iov_buf);
+
+  if (state->str_step > 0)
+    {
+      struct iovec *iov = state->iov;
+      char *buf = array_beg(state->client->str_buf, char);
+      int count = state->iov_count, step = state->str_step;
+
+      if (state->key_count > 0)
+        {
+          iov += 3;
+          count -= 3;
+        }
+
+      while (count > 0)
+        {
+          iov->iov_base = (void *) (buf + (int) (iov->iov_base));
+          iov += step;
+          count -= step;
         }
     }
 }
 
 
-static
-void
-client_mark_failed(struct client *c, int server_index)
-{
-  struct server *s;
-
-  s = &c->servers[server_index];
-
-  if (s->cmd_state.fd != -1)
-    {
-      close(s->cmd_state.fd);
-      s->cmd_state.fd = -1;
-      s->cmd_state.nowait_count = 0;
-      s->cmd_state.pos = s->cmd_state.end = s->cmd_state.eol =
-        s->cmd_state.buf;
-    }
-
-  if (c->max_failures > 0)
-    {
-      time_t now = time(NULL);
-      if (s->failure_expires < now)
-        s->failure_count = 0;
-      ++s->failure_count;
-      /*
-        Set timeout on first failure, and on max_failures.  The idea
-        is that if max_failures had happened during failure_timeout,
-        we do not retry in another failure_timeout seconds.  This is
-        not entirely true: we remember the time of the first failure,
-        but for exact accounting we would have to keep time of each
-        failure.  However such exact measurement is not necessary.
-      */
-      if (s->failure_count == 1 || s->failure_count == c->max_failures)
-        s->failure_expires = now + c->failure_timeout;
-    }
-}
-
-
-static
 int
-process_commands(struct client *c)
+client_execute(struct client *c)
 {
-  int result = MEMCACHED_FAILURE;
   struct timeval to, *pto = c->io_timeout > 0 ? &to : NULL;
   fd_set write_set, read_set;
   int first_iter = 1;
@@ -1289,26 +1346,29 @@ process_commands(struct client *c)
   ignore.sa_flags = 0;
   res = sigaction(SIGPIPE, &ignore, &orig);
   if (res == -1)
-    return result;
+    return MEMCACHED_FAILURE;
 #endif /* ! MSG_NOSIGNAL */
 
   while (1)
     {
-      int max_fd, i, res;
+      struct server *s;
+      int max_fd, res;
 
       max_fd = -1;
-      for (i = 0; i < c->server_count; ++i)
+      for (array_each(c->servers, struct server, s))
         {
           int may_write, may_read;
-          struct command_state *state = &c->servers[i].cmd_state;
+          struct command_state *state = &s->cmd_state;
 
           if (! is_active(state))
             continue;
 
           if (first_iter)
             {
+              state_prepare(state);
+
               may_write = 1;
-              may_read = (state->parse_reply != NULL
+              may_read = (state->reply_count > 0
                           || state->nowait_count > 0);
             }
           else
@@ -1330,45 +1390,13 @@ process_commands(struct client *c)
 
               if (may_write)
                 {
-                  res = send_request(state);
-                  if (res == MEMCACHED_SUCCESS)
-                    {
-                      if (! state->parse_reply)
-                        deactivate(state);
-                    }
-                  else if (res == MEMCACHED_CLOSED)
-                    {
-                      may_read = 0;
-                    }
+                  res = send_request(state, s);
+                  if (res == MEMCACHED_CLOSED)
+                    may_read = 0;
                 }
 
               if (may_read)
-                {
-                  res = process_reply(state);
-                  if (res != MEMCACHED_EAGAIN)
-                    {
-                      state->parse_reply = NULL;
-                      if (state->iov_count == 0)
-                        deactivate(state);
-                      if (res == MEMCACHED_SUCCESS)
-                        result = MEMCACHED_SUCCESS;
-                    }
-                }
-
-              switch (res)
-                {
-                case MEMCACHED_ERROR:
-                  if (! (c->close_on_error || state->noreply))
-                    break;
-
-                  /* else fall into below.  */
-
-                case MEMCACHED_UNKNOWN:
-                case MEMCACHED_CLOSED:
-                  deactivate(state);
-                  client_mark_failed(c, i);
-                  break;
-                }
+                res = process_reply(state, s);
 
               if (is_active(state))
                 {
@@ -1388,15 +1416,15 @@ process_commands(struct client *c)
 
       FD_ZERO(&write_set);
       FD_ZERO(&read_set);
-      for (i = 0; i < c->server_count; ++i)
+      for (array_each(c->servers, struct server, s))
         {
-          struct command_state *state = &c->servers[i].cmd_state;
+          struct command_state *state = &s->cmd_state;
 
           if (is_active(state))
             {
               if (state->iov_count > 0)
                 FD_SET(state->fd, &write_set);
-              if (state->parse_reply || state->nowait_count > 0)
+              if (state->reply_count > 0 || state->nowait_count > 0)
                 FD_SET(state->fd, &read_set);
             }
         }
@@ -1423,9 +1451,9 @@ process_commands(struct client *c)
       */
       if (res <= 0)
         {
-          for (i = 0; i < c->server_count; ++i)
+          for (array_each(c->servers, struct server, s))
             {
-              struct command_state *state = &c->servers[i].cmd_state;
+              struct command_state *state = &s->cmd_state;
 
               if (is_active(state))
                 {
@@ -1434,9 +1462,9 @@ process_commands(struct client *c)
                     requires redesign.
                   */
                   if (state->phase == PHASE_VALUE)
-                    state->u.value.object->free(state->u.value.opaque);
+                    state->object->free(state->u.value.opaque);
 
-                  client_mark_failed(c, i);
+                  client_mark_failed(c, s);
                 }
             }
 
@@ -1454,18 +1482,15 @@ process_commands(struct client *c)
   sigaction(SIGPIPE, &orig, NULL);
 #endif /* ! MSG_NOSIGNAL */
 
-  return result;
+  return MEMCACHED_SUCCESS;
 }
 
 
 static
 int
-get_server_fd(struct client *c, int index)
+get_server_fd(struct client *c, struct server *s)
 {
-  struct server *s;
   struct command_state *state;
-
-  s = &c->servers[index];
 
   /*
     Do not try to try reconnect if had max_failures and
@@ -1494,104 +1519,137 @@ get_server_fd(struct client *c, int index)
     }
 
   if (state->fd == -1)
-    client_mark_failed(c, index);
+    client_mark_failed(c, s);
 
   return state->fd;
 }
 
 
-static
-int
-client_get_server_index(struct client *c, const char *key, size_t key_len)
-{
-  int index, fd;
-
-  index = dispatch_key(&c->dispatch, key, key_len);
-  if (index == -1)
-    return -1;
-
-  fd = get_server_fd(c, index);
-  if (fd == -1)
-    return -1;
-
-  return index;
-}
-
-
-static inline
-int
-iov_buf_extend(struct command_state *state, size_t size)
-{
-  if (state->iov_buf_size < size)
-    {
-      struct iovec *buf =
-        (struct iovec *) realloc(state->iov_buf, size);
-      if (! buf)
-        return MEMCACHED_FAILURE;
-
-      state->iov_buf = buf;
-      state->iov_buf_size = size;
-
-      state->iov = buf;
-    }
-
-  return MEMCACHED_SUCCESS;
-}
-
-
 static inline
 void
-iov_push(struct command_state *state, void *buf, size_t buf_size)
+iov_push(struct command_state *state, const void *buf, size_t buf_size)
 {
-  struct iovec *iov = &state->iov_buf[state->iov_count++];
-  iov->iov_base = buf;
+  struct iovec *iov = array_end(state->iov_buf, struct iovec);
+  iov->iov_base = (void *) buf;
   iov->iov_len = buf_size;
+  array_push(state->iov_buf);
 }
 
 
 static
 int
-push_key(struct command_state *state, int key_index)
+push_index(struct command_state *state, int index)
 {
-  struct key_node *node;
+  struct index_node *node;
   struct client *c;
 
   c = state->client;
-  if (c->key_list_count == c->key_list_capacity)
-    {
-      int capacity = (c->key_list_capacity > 0 ? c->key_list_capacity * 2 : 1);
-      struct key_node *list =
-        (struct key_node *) realloc(c->key_list,
-                                    sizeof(struct key_node) * capacity);
-      if (! list)
-        return MEMCACHED_FAILURE;
+  if (array_extend(c->index_list, struct index_node,
+                   1, ARRAY_EXTEND_TWICE) == -1)
+    return MEMCACHED_FAILURE;
 
-      c->key_list = list;
-      c->key_list_capacity = capacity;
-    }
-
-  if (state->key_tail != -1)
-    c->key_list[state->key_tail].next = c->key_list_count;
+  if (state->index_tail != -1)
+    array_elem(c->index_list, struct index_node, state->index_tail)->next =
+      array_size(c->index_list);
   else
-    state->key_head = c->key_list_count;
+    state->index_head = array_size(c->index_list);
 
-  state->key_tail = c->key_list_count;
+  state->index_tail = array_size(c->index_list);
 
-  node = &c->key_list[state->key_tail];
-  node->key = key_index;
+  node = array_elem(c->index_list, struct index_node, state->index_tail);
+  node->index = index;
   node->next = -1;
 
-  ++c->key_list_count;
+  array_push(c->index_list);
 
   return MEMCACHED_SUCCESS;
 }
 
 
-static inline
-void
-client_reset_for_command(struct client *c)
+static
+struct command_state *
+init_state(struct command_state *state, int index, size_t request_size,
+           size_t str_size, parse_reply_func parse_reply,
+           struct result_object *o, int *noreply)
 {
-  c->key_list_count = 0;
+  state->object = o;
+
+  if (noreply && *noreply)
+    {
+      if (state->client->nowait || state->noreply)
+        parse_reply = NULL;
+      *noreply = state->noreply;
+      state->last_cmd_noreply = state->noreply;
+    }
+  else
+    {
+      state->last_cmd_noreply = 0;
+    }
+
+  if (! is_active(state))
+    command_state_reset(state, (str_size > 0 ? request_size : 0), parse_reply);
+
+  if (array_extend(state->iov_buf, struct iovec,
+                   request_size, ARRAY_EXTEND_EXACT) == -1)
+    {
+      deactivate(state);
+      return NULL;
+    }
+
+  if (str_size > 0
+      && array_extend(state->client->str_buf, char,
+                      str_size, ARRAY_EXTEND_TWICE) == -1)
+    {
+      deactivate(state);
+      return NULL;
+    }
+
+  if (push_index(state, index) != MEMCACHED_SUCCESS)
+    {
+      deactivate(state);
+      return NULL;
+    }
+
+  if (parse_reply)
+    ++state->reply_count;
+  else if (! *noreply)
+    ++state->nowait_count;
+
+  return state;
+}
+
+
+static
+struct command_state *
+get_state(struct client *c, int index, const char *key, size_t key_len,
+          size_t request_size, size_t str_size,
+          parse_reply_func parse_reply, struct result_object *o, int *noreply)
+{
+  struct server *s;
+  int server_index, fd;
+
+  server_index = dispatch_key(&c->dispatch, key, key_len);
+  if (server_index == -1)
+    return NULL;
+
+  s = array_elem(c->servers, struct server, server_index);
+
+  fd = get_server_fd(c, s);
+  if (fd == -1)
+    return NULL;
+
+  return init_state(&s->cmd_state, index, request_size, str_size,
+                    parse_reply, o, noreply);
+}
+
+
+inline
+void
+client_reset(struct client *c)
+{
+  array_clear(c->index_list);
+  array_clear(c->str_buf);
+
   ++c->generation;
 }
 
@@ -1600,465 +1658,389 @@ client_reset_for_command(struct client *c)
 
 
 int
-client_set(struct client *c, enum set_cmd_e cmd,
-           const char *key, size_t key_len,
-           flags_type flags, exptime_type exptime,
-           const void *value, value_size_type value_size, int noreply)
+client_prepare_set(struct client *c, enum set_cmd_e cmd, int key_index,
+                   const char *key, size_t key_len,
+                   flags_type flags, exptime_type exptime,
+                   const void *value, value_size_type value_size,
+                   struct result_object *o, int noreply)
 {
-  int use_nowait = (noreply && c->nowait);
-  int use_noreply;
-  size_t request_size =
-    (sizeof(struct iovec) * (c->prefix_len ? 6 : 5)
-     + sizeof(" " FLAGS_STUB " " EXPTIME_STUB " " VALUE_SIZE_STUB
-              " " NOREPLY "\r\n"));
+  static const size_t request_size = 6;
+  static const size_t str_size =
+    sizeof(" " FLAGS_STUB " " EXPTIME_STUB " " VALUE_SIZE_STUB
+           " " NOREPLY "\r\n");
+
   struct command_state *state;
-  struct iovec *buf_iov;
-  char *buf;
-  int server_index, res;
 
-  client_reset_for_command(c);
+  state = get_state(c, key_index, key, key_len, request_size, str_size,
+                    parse_set_reply, o, &noreply);
+  if (! state)
+    return MEMCACHED_FAILURE;
 
-  server_index = client_get_server_index(c, key, key_len);
-  if (server_index == -1)
-    return MEMCACHED_CLOSED;
-
-  state = &c->servers[server_index].cmd_state;
-  use_noreply = (noreply && state->noreply);
-  command_state_reset(state, (c->prefix_len ? 2 : 1), 1,
-                      (use_noreply || use_nowait ? NULL : parse_set_reply));
-
-  res = iov_buf_extend(state, request_size);
-  if (res != MEMCACHED_SUCCESS)
-    return res;
+  ++state->key_count;
 
   switch (cmd)
     {
     case CMD_SET:
-      iov_push(state, STR_WITH_LEN("set "));
+      iov_push(state, STR_WITH_LEN("set"));
       break;
 
     case CMD_ADD:
-      iov_push(state, STR_WITH_LEN("add "));
+      iov_push(state, STR_WITH_LEN("add"));
       break;
 
     case CMD_REPLACE:
-      iov_push(state, STR_WITH_LEN("replace "));
+      iov_push(state, STR_WITH_LEN("replace"));
       break;
 
     case CMD_APPEND:
-      iov_push(state, STR_WITH_LEN("append "));
+      iov_push(state, STR_WITH_LEN("append"));
       break;
 
     case CMD_PREPEND:
-      iov_push(state, STR_WITH_LEN("prepend "));
-      break;
-    }
-  if (c->prefix_len)
-    iov_push(state, c->prefix, c->prefix_len);
-  iov_push(state, (void *) key, key_len);
-
-  res = push_key(state, 0);
-  if (res != MEMCACHED_SUCCESS)
-    return res;
-
-  buf_iov = &state->iov_buf[state->iov_count];
-  iov_push(state, NULL, 0);
-  iov_push(state, (void *) value, value_size);
-  iov_push(state, STR_WITH_LEN("\r\n"));
-
-  buf = (char *) &state->iov_buf[state->iov_count];
-  buf_iov->iov_base = buf;
-  buf_iov->iov_len = sprintf(buf, " " FMT_FLAGS " " FMT_EXPTIME
-                             " " FMT_VALUE_SIZE "%s\r\n",
-                             flags, exptime, value_size,
-                             (use_noreply ? " " NOREPLY : ""));
-
-  return process_commands(c);
-}
-
-
-int
-client_cas(struct client *c, const char *key, size_t key_len,
-           cas_type cas, flags_type flags, exptime_type exptime,
-           const void *value, value_size_type value_size, int noreply)
-{
-  int use_nowait = (noreply && c->nowait);
-  int use_noreply;
-  size_t request_size =
-    (sizeof(struct iovec) * (c->prefix_len ? 6 : 5)
-     + sizeof(" " FLAGS_STUB " " EXPTIME_STUB " " VALUE_SIZE_STUB
-              " " CAS_STUB " " NOREPLY "\r\n"));
-  struct command_state *state;
-  struct iovec *buf_iov;
-  char *buf;
-  int server_index, res;
-
-  client_reset_for_command(c);
-
-  server_index = client_get_server_index(c, key, key_len);
-  if (server_index == -1)
-    return MEMCACHED_CLOSED;
-
-  state = &c->servers[server_index].cmd_state;
-  use_noreply = (noreply && state->noreply);
-  command_state_reset(state, (c->prefix_len ? 2 : 1), 1,
-                      (use_noreply || use_nowait ? NULL : parse_set_reply));
-
-  res = iov_buf_extend(state, request_size);
-  if (res != MEMCACHED_SUCCESS)
-    return res;
-
-  iov_push(state, STR_WITH_LEN("cas "));
-  if (c->prefix_len)
-    iov_push(state, c->prefix, c->prefix_len);
-  iov_push(state, (void *) key, key_len);
-
-  res = push_key(state, 0);
-  if (res != MEMCACHED_SUCCESS)
-    return res;
-
-  buf_iov = &state->iov_buf[state->iov_count];
-  iov_push(state, NULL, 0);
-  iov_push(state, (void *) value, value_size);
-  iov_push(state, STR_WITH_LEN("\r\n"));
-
-  buf = (char *) &state->iov_buf[state->iov_count];
-  buf_iov->iov_base = buf;
-  buf_iov->iov_len = sprintf(buf, " " FMT_FLAGS " " FMT_EXPTIME
-                             " " FMT_VALUE_SIZE " " FMT_CAS "%s\r\n",
-                             flags, exptime, value_size, cas,
-                             (use_noreply ? " " NOREPLY : ""));
-
-  return process_commands(c);
-}
-
-
-int
-client_get(struct client *c, enum get_cmd_e cmd,
-           const char *key, size_t key_len, struct value_object *o)
-{
-  size_t request_size = (sizeof(struct iovec) * (c->prefix_len ? 4 : 3));
-  struct command_state *state;
-  int server_index, res;
-
-  client_reset_for_command(c);
-
-  server_index = client_get_server_index(c, key, key_len);
-  if (server_index == -1)
-    return MEMCACHED_CLOSED;
-
-  state = &c->servers[server_index].cmd_state;
-  command_state_reset(state, (c->prefix_len ? 2 : 1), 1, parse_get_reply);
-  value_state_reset(&state->u.value, o, (cmd == CMD_GETS));
-
-  res = iov_buf_extend(state, request_size);
-  if (res != MEMCACHED_SUCCESS)
-    return res;
-
-  switch (cmd)
-    {
-    case CMD_GET:
-      iov_push(state, STR_WITH_LEN("get "));
+      iov_push(state, STR_WITH_LEN("prepend"));
       break;
 
-    case CMD_GETS:
-      iov_push(state, STR_WITH_LEN("gets "));
-      break;
+    case CMD_CAS:
+      /* This can't happen.  */
+      return MEMCACHED_FAILURE;
     }
-  if (c->prefix_len)
-    iov_push(state, c->prefix, c->prefix_len);
-  iov_push(state, (void *) key, key_len);
+  iov_push(state, c->prefix, c->prefix_len);
+  iov_push(state, key, key_len);
 
-  res = push_key(state, 0);
-  if (res != MEMCACHED_SUCCESS)
-    return res;
+  {
+    char *buf = array_end(c->str_buf, char);
+    size_t str_size =
+      sprintf(buf, " " FMT_FLAGS " " FMT_EXPTIME " " FMT_VALUE_SIZE "%s\r\n",
+              flags, exptime, value_size, (noreply ? " " NOREPLY : ""));
+    iov_push(state, (void *) array_size(c->str_buf), str_size);
+    array_append(c->str_buf, str_size);
+  }
 
+  iov_push(state, value, value_size);
   iov_push(state, STR_WITH_LEN("\r\n"));
 
-  return process_commands(c);
+  return MEMCACHED_SUCCESS;
 }
 
 
 int
-client_mget(struct client *c, enum get_cmd_e cmd,
-            int key_count, get_key_func get_key, struct value_object *o)
+client_prepare_cas(struct client *c, int key_index,
+                   const char *key, size_t key_len,
+                   cas_type cas, flags_type flags, exptime_type exptime,
+                   const void *value, value_size_type value_size,
+                   struct result_object *o, int noreply)
 {
-  size_t min_request_size =
-    (sizeof(struct iovec) * ((c->prefix_len ? 3 : 2) + 2));
+  static const size_t request_size = 6;
+  static const size_t str_size =
+    sizeof(" " FLAGS_STUB " " EXPTIME_STUB " " VALUE_SIZE_STUB
+           " " CAS_STUB " " NOREPLY "\r\n");
+
   struct command_state *state;
-  int i;
 
-  client_reset_for_command(c);
+  state = get_state(c, key_index, key, key_len, request_size, str_size,
+                    parse_set_reply, o, &noreply);
+  if (! state)
+    return MEMCACHED_FAILURE;
 
-  for (i = 0; i < key_count; ++i)
-    {
-      char *key;
-      size_t key_len;
-      size_t size;
-      int server_index, res;
+  ++state->key_count;
 
-      key = get_key(o->arg, i, &key_len);
+  iov_push(state, STR_WITH_LEN("cas"));
+  iov_push(state, c->prefix, c->prefix_len);
+  iov_push(state, key, key_len);
 
-      server_index = client_get_server_index(c, key, key_len);
-      if (server_index == -1)
-        continue;
+  {
+    char *buf = array_end(c->str_buf, char);
+    size_t str_size =
+      sprintf(buf, " " FMT_FLAGS " " FMT_EXPTIME " " FMT_VALUE_SIZE
+              " " FMT_CAS "%s\r\n", flags, exptime, value_size, cas,
+              (noreply ? " " NOREPLY : ""));
+    iov_push(state, (void *) array_size(c->str_buf), str_size);
+    array_append(c->str_buf, str_size);
+  }
 
-      state = &c->servers[server_index].cmd_state;
+  iov_push(state, value, value_size);
+  iov_push(state, STR_WITH_LEN("\r\n"));
 
-      if (is_active(state))
-        size = (sizeof(struct iovec)
-                * (state->iov_count + (c->prefix_len ? 3 : 2) + 1));
-      else
-        size = min_request_size;
-
-      res = iov_buf_extend(state, size);
-      if (res != MEMCACHED_SUCCESS)
-        {
-          deactivate(state);
-          continue;
-        }
-
-      if (! is_active(state))
-        {
-          command_state_reset(state, (c->prefix_len ? 3 : 2), 0,
-                              parse_get_reply);
-          value_state_reset(&state->u.value, o, (cmd == CMD_GETS));
-
-          switch (cmd)
-            {
-            case CMD_GET:
-              iov_push(state, STR_WITH_LEN("get"));
-              break;
-
-            case CMD_GETS:
-              iov_push(state, STR_WITH_LEN("gets"));
-              break;
-            }
-        }
-
-      iov_push(state, STR_WITH_LEN(" "));
-      if (c->prefix_len)
-        iov_push(state, c->prefix, c->prefix_len);
-      iov_push(state, (void *) key, key_len);
-
-      res = push_key(state, i);
-      if (res != MEMCACHED_SUCCESS)
-        {
-          deactivate(state);
-          continue;
-        }
-    }
-
-  for (i = 0; i < c->server_count; ++i)
-    {
-      state = &c->servers[i].cmd_state;
-
-      if (is_active(state))
-        {
-          state->key_count = (state->iov_count - 1) / c->key_step;
-          iov_push(state, STR_WITH_LEN("\r\n"));
-        }
-    }
-
-  return process_commands(c);
+  return MEMCACHED_SUCCESS;
 }
 
 
 int
-client_arith(struct client *c, enum arith_cmd_e cmd,
-             const char *key, size_t key_len,
-             arith_type arg, arith_type *result, int noreply)
+client_prepare_get(struct client *c, enum get_cmd_e cmd, int key_index,
+                   const char *key, size_t key_len, struct result_object *o)
 {
-  int use_nowait = (noreply && c->nowait);
-  int use_noreply;
-  size_t request_size =
-    (sizeof(struct iovec) * (c->prefix_len ? 4 : 3)
-     + sizeof(" " ARITH_STUB " " NOREPLY "\r\n"));
+  static const size_t request_size = 4;
+
   struct command_state *state;
-  struct iovec *buf_iov;
-  char *buf;
-  int server_index, res;
 
-  client_reset_for_command(c);
+  state = get_state(c, key_index, key, key_len, request_size, 0,
+                    parse_get_reply, o, NULL);
+  if (! state)
+    return MEMCACHED_FAILURE;
 
-  server_index = client_get_server_index(c, key, key_len);
-  if (server_index == -1)
-    return MEMCACHED_CLOSED;
+  ++state->key_count;
 
-  state = &c->servers[server_index].cmd_state;
-  use_noreply = (noreply && state->noreply);
-  command_state_reset(state, (c->prefix_len ? 2 : 1), 1,
-                      (use_noreply || use_nowait ? NULL : parse_arith_reply));
-  arith_state_reset(&state->u.arith, result);
+  if (! array_empty(state->iov_buf))
+    {
+      /* Pop off trailing \r\n because we are about to add another key.  */
+      array_pop(state->iov_buf);
 
-  res = iov_buf_extend(state, request_size);
-  if (res != MEMCACHED_SUCCESS)
-    return res;
+      /* get can't be in noreply mode, so reply_count is positive.  */
+      --state->reply_count;
+    }
+  else
+    {
+      switch (cmd)
+        {
+        case CMD_GET:
+          state->u.value.meta.use_cas = 0;
+          iov_push(state, STR_WITH_LEN("get"));
+          break;
+
+        case CMD_GETS:
+          state->u.value.meta.use_cas = 1;
+          iov_push(state, STR_WITH_LEN("gets"));
+          break;
+        }
+    }
+
+  iov_push(state, c->prefix, c->prefix_len);
+  iov_push(state, key, key_len);
+  iov_push(state, STR_WITH_LEN("\r\n"));
+
+  return MEMCACHED_SUCCESS;
+}
+
+
+int
+client_prepare_incr(struct client *c, enum arith_cmd_e cmd, int key_index,
+                    const char *key, size_t key_len,
+                    arith_type arg, struct result_object *o, int noreply)
+{
+  static const size_t request_size = 4;
+  static const size_t str_size = sizeof(" " ARITH_STUB " " NOREPLY "\r\n");
+
+  struct command_state *state;
+
+  state = get_state(c, key_index, key, key_len, request_size, str_size,
+                    parse_arith_reply, o, &noreply);
+  if (! state)
+    return MEMCACHED_FAILURE;
+
+  ++state->key_count;
 
   switch (cmd)
     {
     case CMD_INCR:
-      iov_push(state, STR_WITH_LEN("incr "));
+      iov_push(state, STR_WITH_LEN("incr"));
       break;
 
     case CMD_DECR:
-      iov_push(state, STR_WITH_LEN("decr "));
+      iov_push(state, STR_WITH_LEN("decr"));
       break;
     }
-  if (c->prefix_len)
-    iov_push(state, c->prefix, c->prefix_len);
-  iov_push(state, (void *) key, key_len);
+  iov_push(state, c->prefix, c->prefix_len);
+  iov_push(state, key, key_len);
 
-  res = push_key(state, 0);
-  if (res != MEMCACHED_SUCCESS)
-    return res;
+  {
+    char *buf = array_end(c->str_buf, char);
+    size_t str_size =
+      sprintf(buf, " " FMT_ARITH "%s\r\n", arg, (noreply ? " " NOREPLY : ""));
+    iov_push(state, (void *) array_size(c->str_buf), str_size);
+    array_append(c->str_buf, str_size);
+  }
 
-  buf_iov = &state->iov_buf[state->iov_count];
-  iov_push(state, NULL, 0);
-  buf = (char *) &state->iov_buf[state->iov_count];
-  buf_iov->iov_base = buf;
-  buf_iov->iov_len = sprintf(buf, " " FMT_ARITH "%s\r\n", arg,
-                             (use_noreply ? " " NOREPLY : ""));
-
-  return process_commands(c);
-
+  return MEMCACHED_SUCCESS;
 }
 
 
 int
-client_delete(struct client *c, const char *key, size_t key_len,
-              delay_type delay, int noreply)
+client_prepare_delete(struct client *c, int key_index,
+                      const char *key, size_t key_len,
+                      delay_type delay, struct result_object *o, int noreply)
 {
-  int use_nowait = (noreply && c->nowait);
-  int use_noreply;
-  size_t request_size =
-    (sizeof(struct iovec) * (c->prefix_len ? 4 : 3)
-     + sizeof(" " DELAY_STUB " " NOREPLY "\r\n"));
+  static const size_t request_size = 4;
+  static const size_t str_size = sizeof(" " DELAY_STUB " " NOREPLY "\r\n");
+
   struct command_state *state;
-  struct iovec *buf_iov;
-  char *buf;
-  int server_index, res;
 
-  client_reset_for_command(c);
+  state = get_state(c, key_index, key, key_len, request_size, str_size,
+                    parse_delete_reply, o, &noreply);
+  if (! state)
+    return MEMCACHED_FAILURE;
 
-  server_index = client_get_server_index(c, key, key_len);
-  if (server_index == -1)
-    return MEMCACHED_CLOSED;
+  ++state->key_count;
 
-  state = &c->servers[server_index].cmd_state;
-  use_noreply = (noreply && state->noreply);
-  command_state_reset(state, (c->prefix_len ? 2 : 1), 1,
-                      (use_noreply || use_nowait ? NULL : parse_delete_reply));
+  iov_push(state, STR_WITH_LEN("delete"));
+  iov_push(state, c->prefix, c->prefix_len);
+  iov_push(state, key, key_len);
 
-  res = iov_buf_extend(state, request_size);
-  if (res != MEMCACHED_SUCCESS)
-    return res;
+  {
+    char *buf = array_end(c->str_buf, char);
+    size_t str_size =
+      sprintf(buf, " " FMT_DELAY "%s\r\n", delay,
+              (noreply ? " " NOREPLY : ""));
+    iov_push(state, (void *) array_size(c->str_buf), str_size);
+    array_append(c->str_buf, str_size);
+  }
 
-  iov_push(state, STR_WITH_LEN("delete "));
-  if (c->prefix_len)
-    iov_push(state, c->prefix, c->prefix_len);
-  iov_push(state, (void *) key, key_len);
-
-  res = push_key(state, 0);
-  if (res != MEMCACHED_SUCCESS)
-    return res;
-
-  buf_iov = &state->iov_buf[state->iov_count];
-  iov_push(state, NULL, 0);
-  buf = (char *) &state->iov_buf[state->iov_count];
-  buf_iov->iov_base = buf;
-  buf_iov->iov_len = sprintf(buf, " " FMT_DELAY "%s\r\n", delay,
-                             (use_noreply ? " " NOREPLY : ""));
-
-  return process_commands(c);
+  return MEMCACHED_SUCCESS;
 }
 
 
 int
-client_flush_all(struct client *c, delay_type delay, int noreply)
+client_flush_all(struct client *c, delay_type delay,
+                 struct result_object *o, int noreply)
 {
-  int use_nowait = (noreply && c->nowait);
-  static const size_t request_size =
-    (sizeof(struct iovec) * 1
-     + sizeof("flush_all " DELAY_STUB " " NOREPLY "\r\n"));
+  static const size_t request_size = 1;
+  static const size_t str_size =
+    sizeof("flush_all " DELAY_STUB " " NOREPLY "\r\n");
+
+  struct server *s;
   double ddelay = delay, delay_step = 0.0;
   int i;
 
-  client_reset_for_command(c);
+  client_reset(c);
 
-  if (c->server_count > 1)
-    delay_step = ddelay / (c->server_count - 1);
+  if (array_size(c->servers) > 1)
+    delay_step = ddelay / (array_size(c->servers) - 1);
   ddelay += delay_step;
 
-  for (i = 0; i < c->server_count; ++i)
+  for (i = 0, array_each(c->servers, struct server, s), ++i)
     {
-      int use_noreply;
       struct command_state *state;
-      struct iovec *buf_iov;
-      char *buf;
-      int fd, res;
+      int fd;
 
       ddelay -= delay_step;
 
-      fd = get_server_fd(c, i);
+      fd = get_server_fd(c, s);
       if (fd == -1)
         continue;
 
-      state = &c->servers[i].cmd_state;
-      use_noreply = (noreply && state->noreply);
-      command_state_reset(state, 0, 0,
-                          (use_noreply || use_nowait ? NULL : parse_ok_reply));
+      state = init_state(&s->cmd_state, i, request_size, str_size,
+                         parse_ok_reply, o, &noreply);
+      if (! state)
+        continue;
 
-      res = iov_buf_extend(state, request_size);
-      if (res != MEMCACHED_SUCCESS)
-        {
-          deactivate(state);
-          continue;
-        }
-
-      buf_iov = &state->iov_buf[state->iov_count];
-      iov_push(state, NULL, 0);
-      buf = (char *) &state->iov_buf[state->iov_count];
-      buf_iov->iov_base = buf;
-      buf_iov->iov_len = sprintf(buf, "flush_all " FMT_DELAY "%s\r\n",
-                                 (delay_type) (ddelay + 0.5),
-                                 (use_noreply ? " " NOREPLY : ""));
+      {
+        char *buf = array_end(c->str_buf, char);
+        size_t str_size =
+          sprintf(buf, "flush_all " FMT_DELAY "%s\r\n",
+                  (delay_type) (ddelay + 0.5), (noreply ? " " NOREPLY : ""));
+        iov_push(state, (void *) array_size(c->str_buf), str_size);
+        array_append(c->str_buf, str_size);
+      }
     }
 
-  return process_commands(c);
+  return client_execute(c);
 }
 
 
 int
-client_server_versions(struct client *c, struct value_object *o)
+client_nowait_push(struct client *c)
 {
-  static const size_t request_size = (sizeof(struct iovec) * 1);
-  int i;
+  struct server *s;
 
-  client_reset_for_command(c);
+  if (! c->nowait)
+    return MEMCACHED_SUCCESS;
 
-  for (i = 0; i < c->server_count; ++i)
+  client_reset(c);
+
+  for (array_each(c->servers, struct server, s))
     {
       struct command_state *state;
-      int fd, res;
+      int fd;
 
-      fd = get_server_fd(c, i);
+      state = &s->cmd_state;
+      if (state->nowait_count == 0)
+        continue;
+
+      fd = get_server_fd(c, s);
       if (fd == -1)
         continue;
 
-      state = &c->servers[i].cmd_state;
-      command_state_reset(state, 0, 0, parse_version_reply);
-      embedded_state_reset(&state->u.embedded, o);
+      /*
+        In order to wait the final pending reply we pretend that one
+        command was never a nowait command, and set parse function to
+        parse_nowait_reply.
+      */
+      --state->nowait_count;
+      command_state_reset(state, 0, parse_nowait_reply);
+      ++state->reply_count;
+    }
 
-      res = iov_buf_extend(state, request_size);
-      if (res != MEMCACHED_SUCCESS)
-        {
-          deactivate(state);
-          continue;
-        }
+  return client_execute(c);
+}
+
+
+int
+client_server_versions(struct client *c, struct result_object *o)
+{
+  static const size_t request_size = 1;
+
+  struct server *s;
+  int i;
+
+  client_reset(c);
+
+  for (i = 0, array_each(c->servers, struct server, s), ++i)
+    {
+      struct command_state *state;
+      int fd;
+
+      fd = get_server_fd(c, s);
+      if (fd == -1)
+        continue;
+
+      state = init_state(&s->cmd_state, i, request_size, 0,
+                         parse_version_reply, o, NULL);
+      if (! state)
+        continue;
 
       iov_push(state, STR_WITH_LEN("version\r\n"));
     }
 
-  return process_commands(c);
+  return client_execute(c);
+}
+
+
+/*
+  When noreply mode is enabled the client may send the last noreply
+  request and close the connection.  The server will see that the
+  connection is closed, and will discard all previously read data
+  without processing it.  To avoid this, we send "version" command and
+  wait for the reply (discarding it).
+*/
+static
+int
+client_noreply_push(struct client *c)
+{
+  static const size_t request_size = 1;
+
+  struct server *s;
+  int i;
+
+  client_reset(c);
+
+  for (i = 0, array_each(c->servers, struct server, s), ++i)
+    {
+      struct command_state *state = &s->cmd_state;
+      int fd;
+
+      if (! state->last_cmd_noreply)
+        continue;
+
+      fd = get_server_fd(c, s);
+      if (fd == -1)
+        continue;
+
+      state = init_state(state, i, request_size, 0,
+                         parse_nowait_reply, NULL, NULL);
+      if (! state)
+        continue;
+
+      iov_push(state, STR_WITH_LEN("version\r\n"));
+    }
+
+  return client_execute(c);
 }

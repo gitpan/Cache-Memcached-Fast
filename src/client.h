@@ -1,5 +1,5 @@
 /*
-  Copyright (C) 2007 Tomash Brechko.  All rights reserved.
+  Copyright (C) 2007-2008 Tomash Brechko.  All rights reserved.
 
   When used to build Perl module:
 
@@ -39,7 +39,8 @@ enum server_status {
   MEMCACHED_CLOSED
 };
 
-enum set_cmd_e { CMD_SET, CMD_ADD, CMD_REPLACE, CMD_APPEND, CMD_PREPEND };
+enum set_cmd_e { CMD_SET, CMD_ADD, CMD_REPLACE, CMD_APPEND, CMD_PREPEND,
+                 CMD_CAS };
 
 enum get_cmd_e { CMD_GET, CMD_GETS };
 
@@ -65,20 +66,25 @@ typedef unsigned long long arith_type;
 #define FMT_ARITH "%llu"
 
 
-typedef char *(*get_key_func)(void *arg, int key_index, size_t *key_len);
-
 typedef void *(*alloc_value_func)(value_size_type value_size, void **opaque);
 typedef void (*store_value_func)(void *arg, void *opaque, int key_index,
-                                 flags_type flags, int use_cas, cas_type cas);
+                                 void *meta);
 typedef void (*free_value_func)(void *opaque);
 
-struct value_object
+struct result_object
 {
   alloc_value_func alloc;
   store_value_func store;
   free_value_func free;
 
   void *arg;
+};
+
+struct meta_object
+{
+  flags_type flags;
+  int use_cas;
+  cas_type cas;
 };
 
 
@@ -132,46 +138,58 @@ void
 client_set_nowait(struct client *c, int enable);
 
 extern
-int
-client_set(struct client *c, enum set_cmd_e cmd,
-           const char *key, size_t key_len,
-           flags_type flags, exptime_type exptime,
-           const void *value, value_size_type value_size, int noreply);
+void
+client_reset(struct client *c);
 
 extern
 int
-client_cas(struct client *c, const char *key, size_t key_len,
-           cas_type cas, flags_type flags, exptime_type exptime,
-           const void *value, value_size_type value_size, int noreply);
+client_prepare_set(struct client *c, enum set_cmd_e cmd, int key_index,
+                   const char *key, size_t key_len,
+                   flags_type flags, exptime_type exptime,
+                   const void *value, value_size_type value_size,
+                   struct result_object *o, int noreply);
 
 extern
 int
-client_get(struct client *c, enum get_cmd_e cmd,
-           const char *key, size_t key_len, struct value_object *o);
+client_prepare_cas(struct client *c, int key_index,
+                   const char *key, size_t key_len,
+                   cas_type cas, flags_type flags, exptime_type exptime,
+                   const void *value, value_size_type value_size,
+                   struct result_object *o, int noreply);
 
 extern
 int
-client_mget(struct client *c, enum get_cmd_e cmd,
-            int key_count, get_key_func get_key, struct value_object *o);
+client_prepare_get(struct client *c, enum get_cmd_e cmd, int key_index,
+                   const char *key, size_t key_len, struct result_object *o);
 
 extern
 int
-client_arith(struct client *c, enum arith_cmd_e cmd,
-             const char *key, size_t key_len,
-             arith_type arg, arith_type *result, int noreply);
+client_prepare_incr(struct client *c, enum arith_cmd_e cmd, int key_index,
+                    const char *key, size_t key_len,
+                    arith_type arg, struct result_object *o, int noreply);
 
 extern
 int
-client_delete(struct client *c, const char *key, size_t key_len,
-              delay_type delay, int noreply);
+client_prepare_delete(struct client *c, int key_index,
+                      const char *key, size_t key_len,
+                      delay_type delay, struct result_object *o, int noreply);
 
 extern
 int
-client_flush_all(struct client *c, delay_type delay, int noreply);
+client_execute(struct client *c);
 
 extern
 int
-client_server_versions(struct client *c, struct value_object *o);
+client_flush_all(struct client *c, delay_type delay,
+                 struct result_object *o, int noreply);
+
+extern
+int
+client_nowait_push(struct client *c);
+
+extern
+int
+client_server_versions(struct client *c, struct result_object *o);
 
 
 #endif /* ! CLIENT_H */

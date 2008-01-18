@@ -1,4 +1,4 @@
-Cache-Memcached-Fast version 0.06
+Cache-Memcached-Fast version 0.07
 =================================
 
 Cache::Memcahced::Fast is a Perl client for memcached, a memory cache
@@ -20,7 +20,7 @@ API and may be used by itself).
 
 The module should compile and work on any Unix-derived system.
 According to CPAN testers it doesn't compile on Windows, patches are
-welcomed.
+welcome.
 
 Despite the low version number (which mainly reflects release history)
 the module is considered to be beta (see BUGS below on how to report
@@ -31,6 +31,15 @@ to Cache::Memcached.
 
 INSTALLATION
 
+Latest release of this module is available from CPAN:
+
+  http://search.cpan.org/dist/Cache-Memcached-Fast/
+
+Latest development tree is available from project home:
+
+  http://openhack.ru/Cache-Memcached-Fast
+
+
 To install this module type the following:
 
    perl Makefile.PL
@@ -39,9 +48,7 @@ To install this module type the following:
    make install
 
 Don't forget to start memcahced daemon on local host port 11211 (the
-default) before running 'make test'.  Note that test case contains
-flush_all command, you probably don't want to run it on a production
-server.
+default) before running 'make test'.
 
 
 DEPENDENCIES
@@ -86,7 +93,7 @@ progress on your bug as I make changes.
 
 COPYRIGHT AND LICENCE
 
-Copyright (C) 2007 Tomash Brechko.  All rights reserved.
+Copyright (C) 2007-2008 Tomash Brechko.  All rights reserved.
 
 This library is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself, either Perl version 5.8.8 or,

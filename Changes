@@ -1,6 +1,62 @@
 Revision history for Perl extension Cache::Memcached::Fast.
 
 
+0.07  2008-01-18
+        - this is a major release that features a significant speed
+        improvement and introduces multi update commands.  It also
+        fixes a bug in nowait mode that was introduced in 0.06.
+        Upgrade is recommended if you are using nowait => 1, or want
+        to employ new features and speed.
+
+        Changes since 0.06:
+
+        For performance reasons all Perl code was converted to XS.  If
+        you performed any benchmarks, you may want to repeat them ;).
+        This change has a drawback that now you can't derive from
+        C::M::F easily.
+
+        Every update command now has its multi equivalent: set_multi,
+        add_multi, replace_multi, append_multi, prepend_multi,
+        incr_multi, decr_multi and delete_multi.  By using multi
+        commands you will reduce request latency: several requests
+        would be sent in one packet, and the client would talk to all
+        servers simultaneously.
+
+        Improved results of update commands: commands that previously
+        returned boolean value now return true for positive server
+        reply, false for negative server reply, and undef on error.
+        Similar to DBI, decr returns "0E0" for positive zero reply,
+        which evaluates to true in a boolean context.
+
+        flush_all now returns a hash 'server_name' => 'bool_result'.
+
+        New commands 'server_versions' and 'nowait_push'.
+
+        New 'utf8' and 'serialize_methods' parameters for constructor.
+
+        script/compare.pl was removed.  Instead script/benchmark.pl
+        takes an optional last argument "compare".
+
+        t/03-flush_all.t was removed.  We use PID as a part of a
+        namespace prefix now, so we don't need clear cache any more.
+        And there are good reasons not to have flush_all: the user may
+        flush a valuable cache by mistake, and "flush_all 0" doesn't
+        work on memcached 1.2.2, so the outcome was uncertain anyway.
+        Without flush_all it's possible to execute in parallel more
+        than one 'make test'.
+
+        Fixed bug in 'nowait' mode that could cause false negative
+        replies to subsequent requests that you are waiting for.
+
+        Workaround the loss of the last 'noreply' request on the
+        server.  'noreply' is still an undocumented feature.
+
+        To support multi commands the API of internal client
+        implementation was changed.  If you were using it as a
+        standalone library---sorry :).  After API will freeze C client
+        library will likely be released on its own.
+
+
 0.06  2007-12-20
         - this release fixes a serious bug and features the 'nowait'
         mode.  Upgrade is recommended.

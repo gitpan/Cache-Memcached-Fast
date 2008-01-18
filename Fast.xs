@@ -1,5 +1,5 @@
 /*
-  Copyright (C) 2007 Tomash Brechko.  All rights reserved.
+  Copyright (C) 2007-2008 Tomash Brechko.  All rights reserved.
 
   This library is free software; you can redistribute it and/or modify
   it under the same terms as Perl itself, either Perl version 5.8.8
@@ -11,27 +11,44 @@
 #include "perl.h"
 #include "XSUB.h"
 
-#include "ppport.h"
-
-
 #include "src/client.h"
 #include <stdlib.h>
 #include <string.h>
 
 
-typedef struct client Cache_Memcached_Fast;
-typedef SV *Ref_SV;
+#define F_STORABLE  0x1
+#define F_COMPRESS  0x2
+#define F_UTF8      0x4
+
+
+struct xs_state
+{
+  struct client *c;
+  AV *servers;
+  int compress_threshold;
+  double compress_ratio;
+  SV *compress_method;
+  SV *decompress_method;
+  SV *serialize_method;
+  SV *deserialize_method;
+  int utf8;
+};
+
+typedef struct xs_state Cache_Memcached_Fast;
 
 
 static
 void
 add_server(Cache_Memcached_Fast *memd, SV *addr_sv, double weight, int noreply)
 {
+  struct client *c = memd->c;
   static const int delim = ':';
   const char *host, *port;
   size_t host_len, port_len;
   STRLEN len;
   int res;
+
+  av_push(memd->servers, newSVsv(addr_sv));
 
   if (weight <= 0.0)
     croak("Server weight should be positive");
@@ -46,12 +63,12 @@ add_server(Cache_Memcached_Fast *memd, SV *addr_sv, double weight, int noreply)
       host_len = port - host;
       ++port;
       port_len = len - host_len - 1;
-      res = client_add_server(memd, host, host_len, port, port_len,
+      res = client_add_server(c, host, host_len, port, port_len,
                               weight, noreply);
     }
   else
     {
-      res = client_add_server(memd, host, len, NULL, 0, weight, noreply);
+      res = client_add_server(c, host, len, NULL, 0, weight, noreply);
     }
   if (res != MEMCACHED_SUCCESS)
     croak("Not enough memory");
@@ -81,10 +98,10 @@ parse_server(Cache_Memcached_Fast *memd, SV *sv)
             if (! addr_sv)
               croak("server should have { address => $addr }");
             ps = hv_fetch(hv, "weight", 6, 0);
-            if (ps)
+            if (ps && SvOK(*ps))
               weight = SvNV(*ps);
             ps = hv_fetch(hv, "noreply", 7, 0);
-            if (ps)
+            if (ps && SvOK(*ps))
               noreply = SvTRUE(*ps);
             add_server(memd, *addr_sv, weight, noreply);
           }
@@ -116,20 +133,96 @@ parse_server(Cache_Memcached_Fast *memd, SV *sv)
 
 static
 void
-parse_config(Cache_Memcached_Fast *memd, HV *conf)
+parse_serialize(Cache_Memcached_Fast *memd, HV *conf)
 {
   SV **ps;
 
-  ps = hv_fetch(conf, "ketama_points", 13, 0);
-  if (ps)
+  memd->utf8 = 0;
+  memd->serialize_method = NULL;
+  memd->deserialize_method = NULL;
+
+  ps = hv_fetch(conf, "utf8", 4, 0);
+  if (ps && SvOK(*ps))
+    memd->utf8 = SvTRUE(*ps);
+
+  ps = hv_fetch(conf, "serialize_methods", 17, 0);
+  if (ps && SvOK(*ps))
     {
-      int res = client_set_ketama_points(memd, SvIV(*ps));
+      AV *av = (AV *) SvRV(*ps);
+      SV *sv;
+
+      sv = *av_fetch(av, 0, 0);
+      if (! (sv && SvROK(sv) && SvTYPE(SvRV(sv)) == SVt_PVCV))
+        croak("Serialize method is not a code reference");
+      memd->serialize_method = SvRV(sv);
+
+      sv = *av_fetch(av, 1, 0);
+      if (! (sv && SvROK(sv) && SvTYPE(SvRV(sv)) == SVt_PVCV))
+        croak("Deserialize method is not a code reference");
+      memd->deserialize_method = SvRV(sv);
+    }
+
+  if (! memd->serialize_method)
+    croak("Serialize method is not specified");
+
+  if (! memd->deserialize_method)
+    croak("Deserialize method is not specified");
+}
+
+
+static
+void
+parse_compress(Cache_Memcached_Fast *memd, HV *conf)
+{
+  SV **ps;
+
+  memd->compress_threshold = -1;
+  memd->compress_ratio = 0.8;
+  memd->compress_method = NULL;
+  memd->decompress_method = NULL;
+
+  ps = hv_fetch(conf, "compress_threshold", 18, 0);
+  if (ps && SvOK(*ps))
+    memd->compress_threshold = SvIV(*ps);
+
+  ps = hv_fetch(conf, "compress_ratio", 14, 0);
+  if (ps && SvOK(*ps))
+    memd->compress_ratio = SvNV(*ps);
+
+  ps = hv_fetch(conf, "compress_methods", 16, 0);
+  if (ps && SvOK(*ps))
+    {
+      AV *av = (AV *) SvRV(*ps);
+      memd->compress_method = newSVsv(*av_fetch(av, 0, 0));
+      memd->decompress_method = newSVsv(*av_fetch(av, 1, 0));
+    }
+  else if (memd->compress_threshold > 0)
+    {
+      warn("Compression module was not found, disabling compression");
+      memd->compress_threshold = -1;
+    }
+}
+
+
+static
+void
+parse_config(Cache_Memcached_Fast *memd, HV *conf)
+{
+  struct client *c = memd->c;
+  SV **ps;
+
+  memd->servers = newAV();
+
+  ps = hv_fetch(conf, "ketama_points", 13, 0);
+  if (ps && SvOK(*ps))
+    {
+      int res = client_set_ketama_points(c, SvIV(*ps));
       if (res != MEMCACHED_SUCCESS)
         croak("client_set_ketama() failed");
     }
 
   ps = hv_fetch(conf, "servers", 7, 0);
-  if (ps)
+  if (ps && SvOK(*ps))
     {
       AV *a;
       int max_index, i;
@@ -149,71 +242,222 @@ parse_config(Cache_Memcached_Fast *memd, HV *conf)
     }
 
   ps = hv_fetch(conf, "namespace", 9, 0);
-  if (ps)
+  if (ps && SvOK(*ps))
     {
       const char *ns;
       STRLEN len;
       ns = SvPV(*ps, len);
-      if (client_set_prefix(memd, ns, len) != MEMCACHED_SUCCESS)
+      if (client_set_prefix(c, ns, len) != MEMCACHED_SUCCESS)
         croak("Not enough memory");
     }
 
   ps = hv_fetch(conf, "connect_timeout", 15, 0);
-  if (ps)
-    {
-      client_set_connect_timeout(memd, SvNV(*ps) * 1000.0);
-    }
+  if (ps && SvOK(*ps))
+    client_set_connect_timeout(c, SvNV(*ps) * 1000.0);
 
   ps = hv_fetch(conf, "io_timeout", 10, 0);
-  if (ps)
-    {
-      client_set_io_timeout(memd, SvNV(*ps) * 1000.0);
-    }
+  if (ps && SvOK(*ps))
+    client_set_io_timeout(c, SvNV(*ps) * 1000.0);
 
   /* For compatibility with Cache::Memcached.  */
   ps = hv_fetch(conf, "select_timeout", 14, 0);
-  if (ps)
-    {
-      client_set_io_timeout(memd, SvNV(*ps) * 1000.0);
-    }
+  if (ps && SvOK(*ps))
+    client_set_io_timeout(c, SvNV(*ps) * 1000.0);
 
   ps = hv_fetch(conf, "max_failures", 12, 0);
-  if (ps)
-    {
-      client_set_max_failures(memd, SvIV(*ps));
-    }
+  if (ps && SvOK(*ps))
+    client_set_max_failures(c, SvIV(*ps));
 
   ps = hv_fetch(conf, "failure_timeout", 15, 0);
-  if (ps)
-    {
-      client_set_failure_timeout(memd, SvIV(*ps));
-    }
+  if (ps && SvOK(*ps))
+    client_set_failure_timeout(c, SvIV(*ps));
 
   ps = hv_fetch(conf, "close_on_error", 14, 0);
-  if (ps)
-    {
-      client_set_close_on_error(memd, SvTRUE(*ps));
-    }
+  if (ps && SvOK(*ps))
+    client_set_close_on_error(c, SvTRUE(*ps));
 
   ps = hv_fetch(conf, "nowait", 6, 0);
-  if (ps)
-    {
-      client_set_nowait(memd, SvTRUE(*ps));
-    }
+  if (ps && SvOK(*ps))
+    client_set_nowait(c, SvTRUE(*ps));
+
+  parse_compress(memd, conf);
+  parse_serialize(memd, conf);
 }
 
 
-struct xs_skey_result
+static inline
+SV *
+compress(Cache_Memcached_Fast *memd, SV *sv, flags_type *flags)
 {
-  SV *sv;
-  flags_type flags;
-  cas_type cas;
-};
+  if (memd->compress_threshold > 0)
+    {
+      STRLEN len = sv_len(sv);
+      SV *csv, *bsv;
+      int count;
+      dSP;
+
+      if (len < (STRLEN) memd->compress_threshold)
+        return sv;
+
+      csv = newSV(0);
+
+      PUSHMARK(SP);
+      XPUSHs(sv_2mortal(newRV_inc(sv)));
+      XPUSHs(sv_2mortal(newRV_noinc(csv)));
+      PUTBACK;
+
+      count = call_sv(memd->compress_method, G_SCALAR);
+
+      SPAGAIN;
+
+      if (count != 1)
+        croak("Compress method returned nothing");
+
+      bsv = POPs;
+      if (SvTRUE(bsv) && sv_len(csv) <= len * memd->compress_ratio)
+        {
+          sv = csv;
+          *flags |= F_COMPRESS;
+        }
+
+      PUTBACK;
+    }
+
+  return sv;
+}
+
+
+static inline
+int
+decompress(Cache_Memcached_Fast *memd, SV **sv, flags_type flags)
+{
+  int res = 1;
+
+  if (flags & F_COMPRESS)
+    {
+      SV *rsv, *bsv;
+      int count;
+      dSP;
+
+      rsv = newSV(0);
+
+      PUSHMARK(SP);
+      XPUSHs(sv_2mortal(newRV_inc(*sv)));
+      XPUSHs(sv_2mortal(newRV_inc(rsv)));
+      PUTBACK;
+
+      count = call_sv(memd->decompress_method, G_SCALAR);
+
+      SPAGAIN;
+
+      if (count != 1)
+        croak("Decompress method returned nothing");
+
+      bsv = POPs;
+      if (SvTRUE(bsv))
+        {
+          SvREFCNT_dec(*sv);
+          *sv = rsv;
+        }
+      else
+        {
+          SvREFCNT_dec(rsv);
+          res = 0;
+        }
+
+      PUTBACK;
+    }
+
+  return res;
+}
+
+
+static inline
+SV *
+serialize(Cache_Memcached_Fast *memd, SV *sv, flags_type *flags)
+{
+  if (SvROK(sv))
+    {
+      int count;
+      dSP;
+
+      PUSHMARK(SP);
+      XPUSHs(sv);
+      PUTBACK;
+
+      count = call_sv(memd->serialize_method, G_SCALAR);
+
+      SPAGAIN;
+
+      if (count != 1)
+        croak("Serialize method returned nothing");
+
+      sv = POPs;
+      *flags |= F_STORABLE;
+
+      PUTBACK;
+    }
+  else if (memd->utf8 && SvUTF8(sv))
+    {
+      /* Copy the value because we will modify it in place.  */
+      sv = sv_2mortal(newSVsv(sv));
+      sv_utf8_encode(sv);
+      *flags |= F_UTF8;
+    }
+
+  return sv;
+}
+
+
+static inline
+int
+deserialize(Cache_Memcached_Fast *memd, SV **sv, flags_type flags)
+{
+  int res = 1;
+
+  if (flags & F_STORABLE)
+    {
+      SV *rsv;
+      int count;
+      dSP;
+
+      PUSHMARK(SP);
+      XPUSHs(*sv);
+      PUTBACK;
+
+      /* FIXME: do we need G_KEPEERR here?  */
+      count = call_sv(memd->deserialize_method, G_SCALAR | G_EVAL);
+
+      SPAGAIN;
+
+      if (count != 1)
+        croak("Deserialize method returned nothing");
+
+      rsv = POPs;
+      if (! SvTRUE(ERRSV))
+        {
+          SvREFCNT_dec(*sv);
+          *sv = SvREFCNT_inc(rsv);
+        }
+      else
+        {
+          res = 0;
+        }
+
+      PUTBACK;
+    }
+  else if ((flags & F_UTF8) && memd->utf8)
+    {
+      res = sv_utf8_decode(*sv);
+    }
+   
+  return res;
+}
 
 
 static
 void *
-key_alloc(value_size_type value_size, void **opaque)
+alloc_value(value_size_type value_size, void **opaque)
 {
   SV *sv;
   char *res;
@@ -231,25 +475,7 @@ key_alloc(value_size_type value_size, void **opaque)
 
 static
 void
-skey_store(void *arg, void *opaque, int key_index, flags_type flags,
-           int use_cas, cas_type cas)
-{
-  struct xs_skey_result *skey_res;
-
-  /* Suppress warning about unused key_index and use_cas.  */
-  if (key_index || use_cas) {}
-
-  skey_res = (struct xs_skey_result *) arg;
-
-  skey_res->sv = (SV *) opaque;
-  skey_res->flags = flags;
-  skey_res->cas = cas;
-}
-
-
-static
-void
-key_free(void *opaque)
+free_value(void *opaque)
 {
   SV *sv = (SV *) opaque;
 
@@ -257,102 +483,121 @@ key_free(void *opaque)
 }
 
 
-struct xs_mkey_result
+struct xs_value_result
 {
-  AV *key_val;
-  AV *flags;
-  I32 ax;
-  int stack_offset;
+  Cache_Memcached_Fast *memd;  
+  SV *vals;
 };
 
 
 static
-char *
-get_key(void *arg, int key_index, size_t *key_len)
-{
-  I32 ax;
-  struct xs_mkey_result *mkey_res;
-  SV *key_sv;
-  char *res;
-  STRLEN len;
-
-  mkey_res = (struct xs_mkey_result *) arg;
-
-  ax = mkey_res->ax;
-  key_sv = ST(mkey_res->stack_offset + key_index);
-  res = SvPV(key_sv, len);
-  *key_len = len;
-
-  return res;
-}
-
-
-static
 void
-mkey_store(void *arg, void *opaque, int key_index, flags_type flags,
-           int use_cas, cas_type cas)
+svalue_store(void *arg, void *opaque, int key_index, void *meta)
 {
-  I32 ax;
-  struct xs_mkey_result *mkey_res;
-  SV *key_sv, *value_sv;
+  SV *value_sv = (SV *) opaque;
+  struct xs_value_result *value_res = (struct xs_value_result *) arg;
+  struct meta_object *m = (struct meta_object *) meta;
 
-  value_sv = (SV *) opaque;
+  /* Suppress warning about unused key_index.  */
+  if (key_index) {}
 
-  mkey_res = (struct xs_mkey_result *) arg;
-
-  ax = mkey_res->ax;
-  key_sv = ST(mkey_res->stack_offset + key_index);
-  av_push(mkey_res->key_val, SvREFCNT_inc(key_sv));
-  if (! use_cas)
+  if (! decompress(value_res->memd, &value_sv, m->flags)
+      || ! deserialize(value_res->memd, &value_sv, m->flags))
     {
-      av_push(mkey_res->key_val, newRV_noinc(value_sv));
+      free_value(value_sv);
+      return;
+    }
+
+  if (! m->use_cas)
+    {
+      value_res->vals = value_sv;
     }
   else
     {
       AV *cas_val = newAV();
       av_extend(cas_val, 1);
-      av_push(cas_val, newSVuv(cas));
-      av_push(cas_val, newRV_noinc(value_sv));
-      av_push(mkey_res->key_val, newRV_noinc((SV *) cas_val));
+      av_push(cas_val, newSVuv(m->cas));
+      av_push(cas_val, value_sv);
+      value_res->vals = newRV_noinc((SV *) cas_val);
     }
-
-  av_push(mkey_res->flags, newSVuv(flags));
 }
 
 
 static
-void *
-embedded_alloc(value_size_type value_size, void **opaque)
+void
+mvalue_store(void *arg, void *opaque, int key_index, void *meta)
 {
-  AV *av;
-  SV *sv;
-  char *res;
+  SV *value_sv = (SV *) opaque;
+  struct xs_value_result *value_res = (struct xs_value_result *) arg;
+  struct meta_object *m = (struct meta_object *) meta;
 
-  av = (AV *) *opaque;
+  if (! decompress(value_res->memd, &value_sv, m->flags)
+      || ! deserialize(value_res->memd, &value_sv, m->flags))
+    {
+      free_value(value_sv);
+      return;
+    }
 
-  sv = newSVpvn("", 0);
-  res = SvGROW(sv, value_size + 1); /* FIXME: check OOM.  */
-  res[value_size] = '\0';
-  SvCUR_set(sv, value_size);
-  av_push(av, sv);
-
-  return (void *) res;
+  if (! m->use_cas)
+    {
+      av_store((AV *) value_res->vals, key_index, value_sv);
+    }
+  else
+    {
+      AV *cas_val = newAV();
+      av_extend(cas_val, 1);
+      av_push(cas_val, newSVuv(m->cas));
+      av_push(cas_val, value_sv);
+      av_store((AV *) value_res->vals, key_index, newRV_noinc((SV *) cas_val));
+    }
 }
 
 
-MODULE = Cache::Memcached::Fast		PACKAGE = Cache::Memcached::Fast::_xs
+static
+void
+result_store(void *arg, void *opaque, int key_index, void *meta)
+{
+  AV *av = (AV *) arg;
+  int res = (int) opaque;
+
+  /* Suppress warning about unused meta.  */
+  if (meta) {}
+
+  if (res)
+    av_store(av, key_index, newSViv(res));
+  else
+    av_store(av, key_index, newSVpvn("", 0));
+}
+
+
+static
+void
+embedded_store(void *arg, void *opaque, int key_index, void *meta)
+{
+  AV *av = (AV *) arg;
+  SV *sv = (SV *) opaque;
+
+  /* Suppress warning about unused meta.  */
+  if (meta) {}
+
+  av_store(av, key_index, sv);
+}
+
+
+MODULE = Cache::Memcached::Fast		PACKAGE = Cache::Memcached::Fast
 
 
 Cache_Memcached_Fast *
-new(class, conf)
+_new(class, conf)
         char *                  class
         SV *                    conf
     PROTOTYPE: $$
     PREINIT:
         Cache_Memcached_Fast *memd;
     CODE:
-        memd = client_init();
-        if (! memd)
+        Newx(memd, 1, Cache_Memcached_Fast);
+        memd->c = client_init();
+        if (! memd->c)
           croak("Not enough memory");
         if (! SvROK(conf) || SvTYPE(SvRV(conf)) != SVt_PVHV)
           croak("Not a hash reference");
@@ -367,253 +612,617 @@ DESTROY(memd)
         Cache_Memcached_Fast *  memd
     PROTOTYPE: $
     CODE:
-        client_destroy(memd);
+        client_destroy(memd->c);
+        if (memd->compress_method)
+          {
+            SvREFCNT_dec(memd->compress_method);
+            SvREFCNT_dec(memd->decompress_method);
+          }
+        SvREFCNT_dec(memd->servers);
+        Safefree(memd);
 
 
-bool
-set(memd, skey, sval, flags, ...)
+void
+enable_compress(memd, enable)
         Cache_Memcached_Fast *  memd
-        SV *                    skey
-        Ref_SV                  sval
-        U32                     flags
+        bool                    enable
+    PROTOTYPE: $$
+    CODE:
+        if (enable && ! memd->compress_method)
+          warn("Compression module was not found, can't enable compression");
+        else if ((memd->compress_threshold > 0) != enable)
+          memd->compress_threshold = -memd->compress_threshold;
+
+
+void
+set(memd, ...)
+        Cache_Memcached_Fast *  memd
     ALIAS:
         add      =  CMD_ADD
         replace  =  CMD_REPLACE
         append   =  CMD_APPEND
         prepend  =  CMD_PREPEND
-    PROTOTYPE: $$$$;$
+        cas      =  CMD_CAS
+    PROTOTYPE: $@
     PREINIT:
+        int noreply;
+        struct result_object object =
+            { NULL, result_store, NULL, NULL };
         const char *key;
         STRLEN key_len;
+        cas_type cas = 0;
         const void *buf;
         STRLEN buf_len;
+        flags_type flags = 0;
         exptime_type exptime = 0;
-        int noreply, res;
-    CODE:
-        if (items > 4 && SvOK(ST(4)))
-          exptime = SvIV(ST(4));
-        key = SvPV(skey, key_len);
-        buf = (void *) SvPV(sval, buf_len);
-        noreply = (GIMME_V == G_VOID);
-        res = client_set(memd, ix, key, key_len, flags, exptime,
-                         buf, buf_len, noreply);
-        /* FIXME: use XSRETURN_{YES|NO} or even TARG.  */
-        RETVAL = (res == MEMCACHED_SUCCESS);
-    OUTPUT:
-        RETVAL
-
-
-bool
-cas(memd, skey, cas, sval, flags, ...)
-        Cache_Memcached_Fast *  memd
-        SV *                    skey
-        U32                     cas
-        Ref_SV                  sval
-        U32                     flags
-    PROTOTYPE: $$$$$;$
-    PREINIT:
-        const char *key;
-        STRLEN key_len;
-        const void *buf;
-        STRLEN buf_len;
-        exptime_type exptime = 0;
-        int noreply, res;
-    CODE:
-        if (items > 4 && SvOK(ST(4)))
-          exptime = SvIV(ST(4));
-        key = SvPV(skey, key_len);
-        buf = (void *) SvPV(sval, buf_len);
-        noreply = (GIMME_V == G_VOID);
-        res = client_cas(memd, key, key_len, cas, flags, exptime,
-                         buf, buf_len, noreply);
-        /* FIXME: use XSRETURN_{YES|NO} or even TARG.  */
-        RETVAL = (res == MEMCACHED_SUCCESS);
-    OUTPUT:
-        RETVAL
-
-
-void
-get(memd, skey)
-        Cache_Memcached_Fast *  memd
-        SV *                    skey
-    ALIAS:
-        gets  =  CMD_GETS
-    PROTOTYPE: $$
-    PREINIT:
-        const char *key;
-        STRLEN key_len;
-        struct xs_skey_result skey_res;
-        struct value_object object =
-            { key_alloc, skey_store, key_free, &skey_res };
+        int arg = 1;
+        SV *sv;
     PPCODE:
-        key = SvPV(skey, key_len);
-        skey_res.sv = NULL;
-        client_get(memd, ix, key, key_len, &object);
-        if (skey_res.sv != NULL)
+        object.arg = newAV();
+        sv_2mortal((SV *) object.arg);
+        noreply = (GIMME_V == G_VOID);
+        client_reset(memd->c);
+        key = SvPV(ST(arg), key_len);
+        ++arg;
+        if (ix == CMD_CAS)
           {
-            dXSTARG;
-
-            if (ix == CMD_GET)
+            cas = SvUV(ST(arg));
+            ++arg;
+          }
+        sv = ST(arg);
+        ++arg;
+        sv = serialize(memd, sv, &flags);
+        sv = compress(memd, sv, &flags);
+        buf = (void *) SvPV(sv, buf_len);
+        if (items > arg)
+          {
+            /* exptime doesn't have to be defined.  */
+            sv = ST(arg);
+            if (SvOK(sv))
+              exptime = SvIV(sv);
+          }
+        if (ix != CMD_CAS)
+          {
+            client_prepare_set(memd->c, ix, 0, key, key_len, flags,
+                               exptime, buf, buf_len, &object, noreply);
+          }
+        else
+          {
+            client_prepare_cas(memd->c, 0, key, key_len, cas, flags,
+                               exptime, buf, buf_len, &object, noreply);
+          }
+        client_execute(memd->c);
+        if (! noreply)
+          {
+            SV **val = av_fetch(object.arg, 0, 0);
+            if (val)
               {
-                PUSHs(sv_2mortal(newRV_noinc(skey_res.sv)));
+                PUSHs(*val);
+                XSRETURN(1);
               }
-            else
-              {
-                AV *cas_val = newAV();
-                av_extend(cas_val, 1);
-                av_push(cas_val, newSVuv(skey_res.cas));
-                av_push(cas_val, newRV_noinc(skey_res.sv));
-                PUSHs(sv_2mortal(newRV_noinc((SV *) cas_val)));
-              }
-            PUSHu(skey_res.flags);
-            XSRETURN(2);
           }
 
 
 void
-mget(memd, ...)
+set_multi(memd, ...)
         Cache_Memcached_Fast *  memd
     ALIAS:
-        mgets  =  CMD_GETS
+        add_multi      =  CMD_ADD
+        replace_multi  =  CMD_REPLACE
+        append_multi   =  CMD_APPEND
+        prepend_multi  =  CMD_PREPEND
+        cas_multi      =  CMD_CAS
     PROTOTYPE: $@
     PREINIT:
-        struct xs_mkey_result mkey_res;
-        struct value_object object =
-            { key_alloc, mkey_store, key_free, &mkey_res };
-        int key_count;
+        int i, noreply;
+        struct result_object object =
+            { NULL, result_store, NULL, NULL };
     PPCODE:
-        key_count = items - 1;
-        mkey_res.ax = ax;
-        mkey_res.stack_offset = 1;  
-        mkey_res.key_val = newAV();
-        mkey_res.flags = newAV();
-        av_extend(mkey_res.key_val, key_count * 2);
-        av_extend(mkey_res.flags, key_count);
-        if (key_count > 0)
-          client_mget(memd, ix, key_count, get_key, &object);
-        EXTEND(SP, 2);
-        PUSHs(sv_2mortal(newRV_noinc((SV *) mkey_res.key_val)));
-        PUSHs(sv_2mortal(newRV_noinc((SV *) mkey_res.flags)));
-        XSRETURN(2);
+        object.arg = newAV();
+        sv_2mortal((SV *) object.arg);
+        noreply = (GIMME_V == G_VOID);
+        client_reset(memd->c);
+        for (i = 1; i < items; ++i)
+          {
+            SV *sv;
+            AV *av;
+            const char *key;
+            STRLEN key_len;
+            /*
+              gcc-3.4.2 gives a warning about possibly uninitialized
+              cas, so we set it to zero.
+            */
+            cas_type cas = 0;
+            const void *buf;
+            STRLEN buf_len;
+            flags_type flags = 0;
+            exptime_type exptime = 0;
+            int arg = 0;
+
+            sv = ST(i);
+            if (! (SvROK(sv) && SvTYPE(SvRV(sv)) == SVt_PVAV))
+              croak("Not an array reference");
+
+            av = (AV *) SvRV(sv);
+            /*
+              The following values should be defined, so we do not do
+              any additional checks for speed.
+            */
+            key = SvPV(*av_fetch(av, arg, 0), key_len);
+            ++arg;
+            if (ix == CMD_CAS)
+              {
+                cas = SvUV(*av_fetch(av, arg, 0));
+                ++arg;
+              }
+            sv = *av_fetch(av, arg, 0);
+            ++arg;
+            sv = serialize(memd, sv, &flags);
+            sv = compress(memd, sv, &flags);
+            buf = (void *) SvPV(sv, buf_len);
+            if (av_len(av) >= arg)
+              {
+                /* exptime doesn't have to be defined.  */
+                SV **ps = av_fetch(av, arg, 0);
+                if (ps && SvOK(*ps))
+                  exptime = SvIV(*ps);
+              }
+
+            if (ix != CMD_CAS)
+              {
+                client_prepare_set(memd->c, ix, i - 1, key, key_len, flags,
+                                   exptime, buf, buf_len, &object, noreply);
+              }
+            else
+              {
+                client_prepare_cas(memd->c, i - 1, key, key_len, cas, flags,
+                                   exptime, buf, buf_len, &object, noreply);
+              }
+          }
+        client_execute(memd->c);
+        if (! noreply)
+          {
+            if (GIMME_V == G_SCALAR)
+              {
+                HV *hv = newHV();
+                for (i = 0; i <= av_len(object.arg); ++i)
+                  {
+                    SV **val = av_fetch(object.arg, i, 0);
+                    if (val && SvOK(*val))
+                      {
+                        SV *key = *av_fetch((AV *) SvRV(ST(i + 1)), 0, 0);
+                        HE *he = hv_store_ent(hv, key,
+                                              SvREFCNT_inc(*val), 0);
+                        if (! he)
+                          SvREFCNT_dec(*val);
+                      }
+                  }
+                PUSHs(sv_2mortal(newRV_noinc((SV *) hv)));
+                XSRETURN(1);
+              }
+            else
+              {
+                I32 max_index = av_len(object.arg);
+                EXTEND(SP, max_index + 1);
+                for (i = 0; i <= max_index; ++i)
+                  {
+                    SV **val = av_fetch(object.arg, i, 0);
+                    if (val)
+                      PUSHs(*val);
+                    else
+                      PUSHs(&PL_sv_undef);
+                  }
+                XSRETURN(max_index + 1);
+              }
+          }
 
 
 void
-incr(memd, skey, ...)
+get(memd, ...)
         Cache_Memcached_Fast *  memd
-        SV *                    skey
     ALIAS:
-        decr  =  CMD_DECR
-    PROTOTYPE: $$;$
+        gets        =  CMD_GETS
+    PROTOTYPE: $@
     PREINIT:
+        struct xs_value_result value_res;
+        struct result_object object =
+            { alloc_value, svalue_store, free_value, &value_res };
         const char *key;
         STRLEN key_len;
-        arith_type arg = 1, result;
-        int noreply, res;
     PPCODE:
-        if (items > 2 && SvOK(ST(2)))
-          arg = SvUV(ST(2));
-        key = SvPV(skey, key_len);
-        noreply = (GIMME_V == G_VOID);
-        res = client_arith(memd, ix, key, key_len, arg, &result, noreply);
-        if (! noreply && res == MEMCACHED_SUCCESS)
+        value_res.memd = memd;
+        value_res.vals = NULL;
+        client_reset(memd->c);
+        key = SvPV(ST(1), key_len);
+        client_prepare_get(memd->c, ix, 0, key, key_len, &object);
+        client_execute(memd->c);
+        if (value_res.vals)
           {
-            dXSTARG;
-
-            /*
-               NOTE: arith_type is at least 64 bit, but Perl UV is 32
-               bit.
-            */
-            PUSHu(result);
+            PUSHs(sv_2mortal(value_res.vals));
             XSRETURN(1);
           }
 
 
-bool
-delete(memd, skey, ...)
+void
+get_multi(memd, ...)
         Cache_Memcached_Fast *  memd
-        SV *                    skey
     ALIAS:
-        remove  =  1
-    PROTOTYPE: $$;$
+        gets_multi  =  CMD_GETS
+    PROTOTYPE: $@
     PREINIT:
+        struct xs_value_result value_res;
+        struct result_object object =
+            { alloc_value, mvalue_store, free_value, &value_res };
+        int i, key_count;
+        HV *hv;
+    PPCODE:
+        key_count = items - 1;
+        value_res.memd = memd;
+        value_res.vals = (SV *) newAV();
+        sv_2mortal(value_res.vals);
+        av_extend((AV *) value_res.vals, key_count - 1);
+        client_reset(memd->c);
+        for (i = 0; i < key_count; ++i)
+          {
+            const char *key;
+            STRLEN key_len;
+
+            key = SvPV(ST(i + 1), key_len);
+            client_prepare_get(memd->c, ix, i, key, key_len, &object);
+          }
+        client_execute(memd->c);
+        hv = newHV();
+        for (i = 0; i <= av_len((AV *) value_res.vals); ++i)
+          {
+            SV **val = av_fetch((AV *) value_res.vals, i, 0);
+            if (val && SvOK(*val))
+              {
+                SV *key = ST(i + 1);
+                HE *he = hv_store_ent(hv, key,
+                                      SvREFCNT_inc(*val), 0);
+                if (! he)
+                  SvREFCNT_dec(*val);
+              }
+          }
+        PUSHs(sv_2mortal(newRV_noinc((SV *) hv)));
+        XSRETURN(1);
+
+
+void
+incr(memd, ...)
+        Cache_Memcached_Fast *  memd
+    ALIAS:
+        decr  =  CMD_DECR
+    PROTOTYPE: $@
+    PREINIT:
+        struct result_object object =
+            { alloc_value, embedded_store, NULL, NULL };
+        int noreply;
+        const char *key;
+        STRLEN key_len;
+        arith_type arg = 1;
+    PPCODE:
+        object.arg = newAV();
+        sv_2mortal((SV *) object.arg);
+        noreply = (GIMME_V == G_VOID);
+        client_reset(memd->c);
+        key = SvPV(ST(1), key_len);
+        if (items > 2)
+          {
+            /* increment doesn't have to be defined.  */
+            SV *sv = ST(2);
+            if (SvOK(sv))
+              arg = SvUV(sv);
+          }
+        client_prepare_incr(memd->c, ix, 0, key, key_len, arg,
+                            &object, noreply);
+        client_execute(memd->c);
+        if (! noreply)
+          {
+            SV **val = av_fetch(object.arg, 0, 0);
+            if (val)
+              {
+                PUSHs(*val);
+                XSRETURN(1);
+              }
+          }
+
+
+void
+incr_multi(memd, ...)
+        Cache_Memcached_Fast *  memd
+    ALIAS:
+        decr_multi  =  CMD_DECR
+    PROTOTYPE: $@
+    PREINIT:
+        struct result_object object =
+            { alloc_value, embedded_store, NULL, NULL };
+        int i, noreply;
+    PPCODE:
+        object.arg = newAV();
+        sv_2mortal((SV *) object.arg);
+        noreply = (GIMME_V == G_VOID);
+        client_reset(memd->c);
+        for (i = 1; i < items; ++i)
+          {
+            SV *sv;
+            AV *av;
+            const char *key;
+            STRLEN key_len;
+            arith_type arg = 1;
+
+            sv = ST(i);
+            if (! SvROK(sv))
+              {
+                key = SvPV(sv, key_len);
+              }
+            else
+              {
+                if (SvTYPE(SvRV(sv)) != SVt_PVAV)
+                  croak("Not an array reference");
+
+                av = (AV *) SvRV(sv);
+                /*
+                  The following values should be defined, so we do not
+                  do any additional checks for speed.
+                */
+                key = SvPV(*av_fetch(av, 0, 0), key_len);
+                if (av_len(av) >= 1)
+                  {
+                    /* increment doesn't have to be defined.  */
+                    SV **ps = av_fetch(av, 1, 0);
+                    if (ps && SvOK(*ps))
+                      arg = SvUV(*ps);
+                  }
+              }
+ 
+            client_prepare_incr(memd->c, ix, i - 1, key, key_len, arg,
+                                &object, noreply);
+          }
+        client_execute(memd->c);
+        if (! noreply)
+          {
+            if (GIMME_V == G_SCALAR)
+              {
+                HV *hv = newHV();
+                for (i = 0; i <= av_len(object.arg); ++i)
+                  {
+                    SV **val = av_fetch(object.arg, i, 0);
+                    if (val && SvOK(*val))
+                      {
+                        SV *key;
+                        HE *he;
+
+                        key = ST(i + 1);
+                        if (SvROK(key))
+                          key = *av_fetch((AV *) SvRV(key), 0, 0);
+
+                        he = hv_store_ent(hv, key, SvREFCNT_inc(*val), 0);
+                        if (! he)
+                          SvREFCNT_dec(*val);
+                      }
+                  }
+                PUSHs(sv_2mortal(newRV_noinc((SV *) hv)));
+                XSRETURN(1);
+              }
+            else
+              {
+                I32 max_index = av_len(object.arg);
+                EXTEND(SP, max_index + 1);
+                for (i = 0; i <= max_index; ++i)
+                  {
+                    SV **val = av_fetch(object.arg, i, 0);
+                    if (val)
+                      PUSHs(*val);
+                    else
+                      PUSHs(&PL_sv_undef);
+                  }
+                XSRETURN(max_index + 1);
+              }
+          }
+
+
+void
+delete(memd, ...)
+        Cache_Memcached_Fast *  memd
+    PROTOTYPE: $@
+    PREINIT:
+        struct result_object object =
+            { NULL, result_store, NULL, NULL };
+        int noreply;
         const char *key;
         STRLEN key_len;
         delay_type delay = 0;
-        int noreply, res;
-    CODE:
-        /* Suppress warning about unused ix.  */
-        if (ix) {}
-        if (items > 2 && SvOK(ST(2)))
-          delay = SvUV(ST(2));
-        key = SvPV(skey, key_len);
+    PPCODE:
+        object.arg = newAV();
+        sv_2mortal((SV *) object.arg);
         noreply = (GIMME_V == G_VOID);
-        res = client_delete(memd, key, key_len, delay, noreply);
-        /* FIXME: use XSRETURN_{YES|NO} or even TARG.  */
-        RETVAL = (res == MEMCACHED_SUCCESS);
-    OUTPUT:
-        RETVAL
+        client_reset(memd->c);
+        key = SvPV(ST(1), key_len);
+        if (items > 2)
+          {
+            /* delay doesn't have to be defined.  */
+            SV *sv = ST(2);
+            if (SvOK(sv))
+              delay = SvUV(sv);
+          }
+        client_prepare_delete(memd->c, 0, key, key_len, delay,
+                              &object, noreply);
+        client_execute(memd->c);
+        if (! noreply)
+          {
+            SV **val = av_fetch(object.arg, 0, 0);
+            if (val)
+              {
+                PUSHs(*val);
+                XSRETURN(1);
+              }
+          }
 
 
-bool
+void
+delete_multi(memd, ...)
+        Cache_Memcached_Fast *  memd
+    PROTOTYPE: $@
+    PREINIT:
+        struct result_object object =
+            { NULL, result_store, NULL, NULL };
+        int i, noreply;
+    PPCODE:
+        object.arg = newAV();
+        sv_2mortal((SV *) object.arg);
+        noreply = (GIMME_V == G_VOID);
+        client_reset(memd->c);
+        for (i = 1; i < items; ++i)
+          {
+            SV *sv;
+            AV *av;
+            const char *key;
+            STRLEN key_len;
+            delay_type delay = 0;
+
+            sv = ST(i);
+            if (! SvROK(sv))
+              {
+                key = SvPV(sv, key_len);
+              }
+            else
+              {
+                if (SvTYPE(SvRV(sv)) != SVt_PVAV)
+                  croak("Not an array reference");
+
+                av = (AV *) SvRV(sv);
+                /*
+                  The following values should be defined, so we do not
+                  do any additional checks for speed.
+                */
+                key = SvPV(*av_fetch(av, 0, 0), key_len);
+                if (av_len(av) >= 1)
+                  {
+                    /* delay doesn't have to be defined.  */
+                    SV **ps = av_fetch(av, 1, 0);
+                    if (ps && SvOK(*ps))
+                      delay = SvUV(*ps);
+                  }
+              }
+ 
+            client_prepare_delete(memd->c, i - 1, key, key_len, delay,
+                                  &object, noreply);
+          }
+        client_execute(memd->c);
+        if (! noreply)
+          {
+            if (GIMME_V == G_SCALAR)
+              {
+                HV *hv = newHV();
+                for (i = 0; i <= av_len(object.arg); ++i)
+                  {
+                    SV **val = av_fetch(object.arg, i, 0);
+                    if (val && SvOK(*val))
+                      {
+                        SV *key;
+                        HE *he;
+
+                        key = ST(i + 1);
+                        if (SvROK(key))
+                          key = *av_fetch((AV *) SvRV(key), 0, 0);
+
+                        he = hv_store_ent(hv, key, SvREFCNT_inc(*val), 0);
+                        if (! he)
+                          SvREFCNT_dec(*val);
+                      }
+                  }
+                PUSHs(sv_2mortal(newRV_noinc((SV *) hv)));
+                XSRETURN(1);
+              }
+            else
+              {
+                I32 max_index = av_len(object.arg);
+                EXTEND(SP, max_index + 1);
+                for (i = 0; i <= max_index; ++i)
+                  {
+                    SV **val = av_fetch(object.arg, i, 0);
+                    if (val)
+                      PUSHs(*val);
+                    else
+                      PUSHs(&PL_sv_undef);
+                  }
+                XSRETURN(max_index + 1);
+              }
+          }
+
+
+HV *
 flush_all(memd, ...)
         Cache_Memcached_Fast *  memd
     PROTOTYPE: $;$
     PREINIT:
         delay_type delay = 0;
-        int noreply, res;
-    CODE:
-        if (items > 1 && SvOK(ST(1)))
-          delay = SvUV(ST(1));
-        noreply = (GIMME_V == G_VOID);
-        res = client_flush_all(memd, delay, noreply);
-        /* FIXME: use XSRETURN_{YES|NO} or even TARG.  */
-        RETVAL = (res == MEMCACHED_SUCCESS);
-    OUTPUT:
-        RETVAL
-
-
-AV *
-server_versions(memd)
-        Cache_Memcached_Fast *  memd
-    PROTOTYPE: $
-    PREINIT:
-        struct value_object object = { embedded_alloc, NULL, NULL, NULL };
-    CODE:
-        RETVAL = newAV();
-        /* Why sv_2mortal() is needed is explained in perlxs.  */
-        sv_2mortal((SV *) RETVAL);
-        object.arg = RETVAL;
-        client_server_versions(memd, &object);
-    OUTPUT:
-        RETVAL
-
-
-HV *
-_rvav2rvhv(array)
-        AV *                    array
-    PROTOTYPE: $
-    PREINIT:
-        I32 max_index, i;
+        struct result_object object =
+            { NULL, result_store, NULL, NULL };
+        int noreply;
     CODE:
         RETVAL = newHV();
         /* Why sv_2mortal() is needed is explained in perlxs.  */
         sv_2mortal((SV *) RETVAL);
-        max_index = av_len(array);
-        if ((max_index & 1) != 1)
-          croak("Even sized list expected");
-        i = 0;
-        while (i <= max_index)
+        object.arg = sv_2mortal((SV *) newAV());
+        if (items > 1 && SvOK(ST(1)))
+          delay = SvUV(ST(1));
+        noreply = (GIMME_V == G_VOID);
+        client_flush_all(memd->c, delay, &object, noreply);
+        if (! noreply)
           {
-            SV **pkey, **pval;
-            HE *he;
+            int i;
+            for (i = 0; i <= av_len(object.arg); ++i)
+              {
+                SV **server = av_fetch(memd->servers, i, 0);
+                SV **version = av_fetch(object.arg, i, 0);
+                if (version && SvOK(*version))
+                  {
+                    HE *he = hv_store_ent(RETVAL, *server,
+                                          SvREFCNT_inc(*version), 0);
+                    if (! he)
+                      SvREFCNT_dec(*version);
+                  }
+              }
+          }
+    OUTPUT:
+        RETVAL
 
-            pkey = av_fetch(array, i++, 0);
-            pval = av_fetch(array, i++, 0);
-            if (! (pkey && pval))
-              croak("Undefined values in the list");
-            he = hv_store_ent(RETVAL, *pkey, SvREFCNT_inc(*pval), 0);
-            if (! he)
-              SvREFCNT_dec(*pval);
+
+void
+nowait_push(memd)
+        Cache_Memcached_Fast *  memd
+    PROTOTYPE: $
+    CODE:
+        client_nowait_push(memd->c);
+
+
+HV *
+server_versions(memd)
+        Cache_Memcached_Fast *  memd
+    PROTOTYPE: $
+    PREINIT:
+        struct result_object object =
+            { alloc_value, embedded_store, NULL, NULL };
+        int i;
+    CODE:
+        RETVAL = newHV();
+        /* Why sv_2mortal() is needed is explained in perlxs.  */
+        sv_2mortal((SV *) RETVAL);
+        object.arg = sv_2mortal((SV *) newAV());
+        client_server_versions(memd->c, &object);
+        for (i = 0; i <= av_len(object.arg); ++i)
+          {
+            SV **server = av_fetch(memd->servers, i, 0);
+            SV **version = av_fetch(object.arg, i, 0);
+            if (version && SvOK(*version))
+              {
+                HE *he = hv_store_ent(RETVAL, *server,
+                                      SvREFCNT_inc(*version), 0);
+                if (! he)
+                  SvREFCNT_dec(*version);
+              }
           }
     OUTPUT:
         RETVAL

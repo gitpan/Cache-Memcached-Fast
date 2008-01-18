@@ -1,4 +1,4 @@
-# Copyright (C) 2007 Tomash Brechko.  All rights reserved.
+# Copyright (C) 2007-2008 Tomash Brechko.  All rights reserved.
 #
 # This file is part of free software; you can redistribute it and/or
 # modify it under the same terms as Perl itself, either Perl version
@@ -9,27 +9,23 @@
 
 TYPEMAP
 Cache_Memcached_Fast *      T_CACHE_MEMCACHED_FAST
-Ref_SV                      T_REF_SV
 
 
 INPUT
 T_CACHE_MEMCACHED_FAST
-        if (sv_derived_from($arg, \"Cache::Memcached::Fast::_xs\"))
+        /*
+          We disable the derived check because it's kinda useless but
+          slow.
+        */
+        if (1 || sv_derived_from($arg, \"Cache::Memcached::Fast\"))
           {
             IV tmp = SvIV((SV *) SvRV($arg));
             $var = INT2PTR(Cache_Memcached_Fast *, tmp);
           }
         else
-          croak(\"$var is not of type Cache::Memcached::Fast::_xs\");
-T_REF_SV
-        if (SvROK($arg))
-          $var = (SV *) SvRV($arg);
-        else
-          croak(\"$var is not a reference\")
+          croak(\"$var is not of type Cache::Memcached::Fast\");
 
 
 OUTPUT
 T_CACHE_MEMCACHED_FAST
         sv_setref_pv($arg, class, (void*) $var);
-T_REF_SV
-        $arg = newRV((SV *) $var);
