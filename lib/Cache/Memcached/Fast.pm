@@ -14,11 +14,11 @@ Cache::Memcached::Fast - Perl client for B<memcached>, in C language
 
 =head1 VERSION
 
-Version 0.07
+Version 0.08.
 
 =cut
 
-our $VERSION = '0.07';
+our $VERSION = '0.08';
 
 
 =head1 SYNOPSIS
@@ -35,13 +35,14 @@ our $VERSION = '0.07';
       close_on_error => 1,
       compress_threshold => 100_000,
       compress_ratio => 0.9,
-      compress_algo => 'deflate',
+      compress_methods => [ \&IO::Compress::Gzip::gzip,
+                            \&IO::Uncompress::Gunzip::gunzip ],
       max_failures => 3,
       failure_timeout => 2,
       ketama_points => 150,
       nowait => 1,
       serialize_methods => [ \&Storable::freeze, \&Storable::thaw ],
-      utf8 => ($^V >= 5.008001 ? 1 : 0),
+      utf8 => ($^V ge v5.8.1 ? 1 : 0),
   });
 
   # Get server versions.
@@ -131,35 +132,6 @@ use Storable;
 
 require XSLoader;
 XSLoader::load('Cache::Memcached::Fast', $VERSION);
-
-
-# BIG FAT WARNING: Perl assignment copies the value, so below we try
-# to avoid any copying by passing references around.  Any code
-# modifications should try to preserve this.
-
-
-my %compress_algo;
-
-
-BEGIN {
-    my @algo = (
-        'Gzip'        =>  'Gunzip',
-        'Zip'         =>  'Unzip',
-        'Bzip2'       =>  'Bunzip2',
-        'Deflate'     =>  'Inflate',
-        'RawDeflate'  =>  'RawInflate',
-        'Lzop'        =>  'UnLzop',
-        'Lzf'         =>  'UnLzf',
-    );
-
-    while (my ($c, $u) = splice(@algo, 0, 2)) {
-        my $key = lc $c;
-        my $val = ["IO::Compress::$c", "IO::Uncompress::$u",
-                   "IO::Compress::${c}::" . lc $c,
-                   "IO::Uncompress::${u}::" . lc $u];
-        $compress_algo{$key} = $val;
-    }
-}
 
 
 =head1 CONSTRUCTOR
@@ -316,7 +288,7 @@ setting.
 
 The value is an integer.  When positive it denotes the threshold size
 in bytes: data with the size equal or larger than this should be
-compressed.  See L</compress_ratio> and L</compress_algo> below.
+compressed.  See L</compress_ratio> and L</compress_methods> below.
 
 Negative value disables compression.
 
@@ -332,16 +304,35 @@ should be less or equal to S<(original-size * I<compress_ratio>)>.
 Otherwise the data will be stored uncompressed.
 
 
-=item I<compress_algo>
+=item I<compress_methods>
 
-  compress_algo => 'bzip2'
-  (default: 'gzip')
+  compress_methods => [ \&IO::Compress::Gzip::gzip,
+                        \&IO::Uncompress::Gunzip::gunzip ]
+  (default: [ sub { ${$_[1]} = Compress::Zlib::memGzip(${$_[0]}) },
+              sub { ${$_[1]} = Compress::Zlib::memGunzip(${$_[0]}) } ]
+   when Compress::Zlib is available)
 
-The value is a scalar with the name of the compression algorithm
-(currently known are 'gzip', 'zip', 'bzip2', 'deflate', 'rawdeflate',
-'lzop', 'lzf').  You have to have corresponding IO::Compress::<Algo>
-installed, otherwise the module will give a warning and compression
-will be disabled.
+The value is a reference to an array holding two code references for
+compression and decompression routines respectively.
+
+Compression routine is called when the size of the I<$value> passed to
+L</set> method family is greater than or equal to
+L</compress_threshold> (also see L</compress_ratio>).  The fact that
+compression was performed is remembered along with the data, and
+decompression routine is called on data retrieval with L</get> method
+family.  The interface of these routines should be the same as for
+B<IO::Compress> family (for instance see
+L<IO::Compress::Gzip::gzip|IO::Compress::Gzip/gzip> and
+L<IO::Uncompress::Gunzip::gunzip|IO::Uncompress::Gunzip/gunzip>).
+I.e. compression routine takes a reference to scalar value and a
+reference to scalar where compressed result will be stored.
+Decompression routine takes a reference to scalar with compressed data
+and a reference to scalar where uncompressed result will be stored.
+Both routines should return true on success, and false on error.
+
+By default we use L<Compress::Zlib|Compress::Zlib> because as of this
+writing it appears to be much faster than
+L<IO::Uncompress::Gunzip|IO::Uncompress::Gunzip>.
 
 
 =item I<max_failures>
@@ -396,17 +387,17 @@ Serialization routine is called when the I<$value> passed to L</set>
 method family is a reference.  The fact that serialization was
 performed is remembered along with the data, and deserialization
 routine is called on data retrieval with L</get> method family.  The
-interface of these routines should be the same as of
-I<Storable::nfreeze> and I<Storable::thaw> (see L<Storable|Storable>).
-I.e. serialization routine takes a reference and returns a scalar
-string; it should not fail.  Deserialization routine takes scalar
-string and returns a reference; if deserialization fails (say, wrong
-data format) it should throw an exception (call I<die>).  The
-exception will be caught by the module and L</get> will then pretend
-that the key hasn't been found.
+interface of these routines should be the same as for
+L<Storable::nfreeze|Storable/nfreeze> and
+L<Storable::thaw|Storable/thaw>.  I.e. serialization routine takes a
+reference and returns a scalar string; it should not fail.
+Deserialization routine takes scalar string and returns a reference;
+if deserialization fails (say, wrong data format) it should throw an
+exception (call I<die>).  The exception will be caught by the module
+and L</get> will then pretend that the key hasn't been found.
 
 
-=item I<utf8> (B<experimental, Perl 5.8.1 and later only>)
+=item I<utf8> (B<experimental, Perl 5.8.1 and later>)
 
   utf8 => 1
   (default: disabled)
@@ -418,33 +409,113 @@ retrieved data is marked as being UTF-8 octet sequence).  See
 L<perlunicode|perlunicode>.
 
 
+=item I<check_args>
+
+  check_args => 'skip'
+  (default: not 'skip')
+
+The value is a string.  Currently the only recognized string is
+I<'skip'>.
+
+By default all constructor parameter names are checked to be
+recognized, and a warning is given for unknown parameter.  This will
+catch spelling errors that otherwise might go unnoticed.
+
+When set to I<'skip'>, the check will be bypassed.  This may be
+desired when you share the same argument hash among different client
+versions, or among different clients.
+
+
 =back
 
 =back
 
 =cut
 
+our %known_params = (
+    servers => [ { address => 1, weight => 1, noreply => 1 } ],
+    namespace => 1,
+    nowait => 1,
+    connect_timeout => 1,
+    io_timeout => 1,
+    select_timeout => 1,
+    close_on_error => 1,
+    compress_threshold => 1,
+    compress_ratio => 1,
+    compress_methods => 1,
+    compress_algo => sub {
+        carp "compress_algo has been removed in 0.08,"
+          . " use compress_methods instead"
+    },
+    max_failures => 1,
+    failure_timeout => 1,
+    ketama_points => 1,
+    serialize_methods => 1,
+    utf8 => 1,
+    check_args => 1,
+);
+
+
+sub _check_args {
+    my ($checker, $args, $level) = @_;
+
+    $level = 0 unless defined $level;
+
+    my @unknown;
+
+    if (ref($args) ne 'HASH') {
+        if (ref($args) eq 'ARRAY' and ref($checker) eq 'ARRAY') {
+            foreach my $v (@$args) {
+                push @unknown, _check_args($checker->[0], $v, $level + 1);
+            }
+        }
+        return @unknown;
+    }
+
+    if (exists $args->{check_args}
+        and lc($args->{check_args}) eq 'skip') {
+        return;
+    }
+
+    while (my ($k, $v) = each %$args) {
+        if (exists $checker->{$k}) {
+            if (ref($checker->{$k}) eq 'CODE') {
+                $checker->{$k}->($args, $k, $v);
+            } elsif (ref($checker->{$k})) {
+                push @unknown, _check_args($checker->{$k}, $v, $level + 1);
+            }
+        } else {
+            push @unknown, $k;
+        }
+    }
+
+    if ($level > 0) {
+        return @unknown;
+    } else {
+        carp "Unknown parameter: @unknown" if @unknown;
+    }
+}
+
+
 sub new {
     my Cache::Memcached::Fast $class = shift;
     my ($conf) = @_;
 
-    my $compress = $compress_algo{lc($conf->{compress_algo} || 'gzip')};
-    if (defined $compress) {
-        if (eval "require $compress->[0]"
-            and eval "require $compress->[1]") {
-            no strict 'refs';
-            $conf->{compress_methods} = [ map { \&$_ } @{$compress}[2, 3] ];
-        } else {
-            undef $conf->{compress_methods};
-        }
-    } else {
-        carp "Compress algorithm '$conf->{compress_algo}' is not known to"
-            . " Cache::Memcached::Fast, disabling compression";
-        undef $conf->{compress_methods};
-        $conf->{compress_threshold} = -1;
+    _check_args(\%known_params, $conf);
+
+    if (not $conf->{compress_methods} and eval "require Compress::Zlib") {
+        # Note that the functions below can't return false when
+        # operation succeed.  This is because "" and "0" compress to a
+        # longer values (because of additional format data), and
+        # compress_ratio will force them to be stored uncompressed,
+        # thus decompression will never return them.
+        $conf->{compress_methods} = [
+            sub { ${$_[1]} = Compress::Zlib::memGzip(${$_[0]}) },
+            sub { ${$_[1]} = Compress::Zlib::memGunzip(${$_[0]}) }
+        ];
     }
 
-    if ($conf->{utf8} and $^V < 5.008001) {
+    if ($conf->{utf8} and $^V lt v5.8.1) {
         carp "'utf8' may be enabled only for Perl >= 5.8.1, disabled";
         undef $conf->{utf8};
     }
@@ -467,8 +538,8 @@ Enable compression when boolean I<$enable> is true, disable when
 false.
 
 Note that you can enable compression only when you set
-L</compress_threshold> to some positive value and L</compress_algo>
-holds the name of a known compression algorithm.
+L</compress_threshold> to some positive value and L</compress_methods>
+is set.
 
 I<Return:> none.
 
@@ -485,7 +556,8 @@ I<Return:> none.
 Store the I<$value> on the server under the I<$key>.  I<$key> should
 be a scalar.  I<$value> should be defined and may be of any Perl data
 type.  When it is a reference, the referenced Perl data structure will
-be transparently serialized with L<Storable|Storable> module.
+be transparently serialized by routines specified with
+L</serialize_methods>, which see.
 
 Optional I<$expiration_time> is a positive integer number of seconds
 after which the value will expire and wouldn't be accessible any
@@ -885,7 +957,7 @@ number, zero is assumed.  An optional I<$decrement> should be a
 positive integer, when not given 1 is assumed.  Note that the server
 I<does> check for underflow, attempt to decrement the value below zero
 would set the value to zero.  Similar to L<DBI|DBI>, zero is returned
-as "0E0", and evaluates to true in a boolean context.
+as I<"0E0">, and evaluates to true in a boolean context.
 
 I<Return:> unsigned integer, new value for the I<$key>, or false for
 negative server reply, or I<undef> in case of some error.
@@ -1051,11 +1123,12 @@ L<Cache::Memcached|Cache::Memcached>.  Where constructor parameters
 are the same as in Cache::Memcached, the default values are also the
 same, and new parameters are disabled by default (the exception is
 L</close_on_error>, which is absent in Cache::Memcached and enabled by
-default in this module).  Internally Cache::Memcached::Fast uses the
-same hash function as Cache::Memcached, and thus should distribute the
-keys across several servers the same way.  So both modules may be used
-interchangeably.  Most users of the original module should be able to
-use this module after replacing I<"Cache::Memcached"> with
+default in this module, and L</check_args>, which see).  Internally
+Cache::Memcached::Fast uses the same hash function as
+Cache::Memcached, and thus should distribute the keys across several
+servers the same way.  So both modules may be used interchangeably.
+Most users of the original module should be able to use this module
+after replacing I<"Cache::Memcached"> with
 I<"Cache::Memcached::Fast">, without further code modifications.
 However, as of this release, the following features of
 Cache::Memcached are not supported by Cache::Memcached::Fast (and some
@@ -1208,6 +1281,9 @@ L<http://search.cpan.org/dist/Cache-Memcached-Fast>
 
 =head1 SEE ALSO
 
+L<http://openhack.ru/Cache-Memcached-Fast> - project home.  Latest
+development tree can be found there.
+
 L<Cache::Memcached|Cache::Memcached> - original pure Perl B<memcached>
 client.
 
@@ -1216,10 +1292,10 @@ L<http://www.danga.com/memcached/> - B<memcached> website.
 
 =head1 AUTHORS
 
-Tomash Brechko, C<< <tomash.brechko at gmail.com> >> - design and
+S<Tomash Brechko>, C<< <tomash.brechko at gmail.com> >> - design and
 implementation.
 
-Michael Monashev, C<< <postmaster at softsearch.ru> >> - project
+S<Michael Monashev>, C<< <postmaster at softsearch.ru> >> - project
 management, design suggestions, testing.
 
 
@@ -1227,7 +1303,7 @@ management, design suggestions, testing.
 
 Development of this module is sponsored by S<Monashev Co. Ltd.>
 
-Thanks to Peter J. Holzer for enlightening on UTF-8 support.
+Thanks to S<Peter J. Holzer> for enlightening on UTF-8 support.
 
 
 =head1 WARRANTY

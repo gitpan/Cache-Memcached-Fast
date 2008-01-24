@@ -26,7 +26,7 @@ use strict;
 use constant default_iteration_count => 1_000;
 use constant key_count => 100;
 use constant NOWAIT => 1;
-use constant NOREPLY => 0;
+use constant NOREPLY => 1;
 
 my $value = 'x' x 40;
 
@@ -82,9 +82,18 @@ my $new = new Cache::Memcached::Fast {
 
 my $version = $new->server_versions;
 if (keys %$version != @addrs) {
+    my @servers = map {
+        if (ref($_) eq 'HASH') {
+            $_->{address};
+        } elsif (ref($_) eq 'ARRAY') {
+            $_->[0];
+        } else {
+            $_;
+        }
+    } @addrs;
     warn "No server is running at "
         . join(', ', grep { not exists $version->{$_} }
-               @{$new->{servers}})
+               @servers)
         . "\n";
     exit 1;
 }
@@ -112,6 +121,23 @@ sub merge_hash {
     while (my ($k, $v) = each %$h2) {
         $h1->{$k} = $v;
     }
+}
+
+
+sub bench_finalize {
+    my ($title, $code, $finalize) = @_;
+
+    print "Benchmark: timing $count iterations of $title...\n";
+    my $b1 = timeit($count, $code);
+
+    # We call nowait_push here.  Otherwise the time of gathering
+    # the results would be added to the following commands.
+    my $b2 = timeit(1, $finalize);
+
+    my $res = timesum($b1, $b2);
+    print "$title: ", timestr($res, 'auto'), "\n";
+
+    return { $title => $res };
 }
 
 
@@ -152,34 +178,37 @@ sub run {
                                  foreach (1..key_count) },
     ) if defined $old and $method =~ /$old_method/o;
 
-    if (defined $value and NOREPLY) {
-        push @test, (
-            "$method noreply" => sub { $new_noreply->$method(&$params('pr'))
-                                         foreach (1..key_count) },
-        );
-
-        push @test, (
-            "old $method noreply" => sub { $old->$method(&$params('or'))
-                                             foreach (1..key_count) },
-        ) if defined $old and $method =~ /$old_method/o;
-    }
-
     my $bench = timethese($count, {@test});
 
-    if (defined $value and NOWAIT) {
-        my $title = "$method nowait";
-        print "Benchmark: timing $count iterations of $title...\n";
-        my $b1 = timeit($count, sub { $new->$method(&$params('pw'))
-                                        foreach (1..key_count) });
+    if (defined $value and NOREPLY) {
+        # We call get('no-such-key') here.  Otherwise the time of
+        # sending the requests might be added to the following
+        # commands.
+        my $res = bench_finalize("$method noreply",
+                                 sub { $new_noreply->$method(&$params('pr'))
+                                         foreach (1..key_count) },
+                                 sub { $new_noreply->get('no-such-key') });
 
+        merge_hash($bench, $res);
+
+        if (defined $old and $method =~ /$old_method/o) {
+            $res = bench_finalize("old $method noreply",
+                                  sub { $old->$method(&$params('or'))
+                                          foreach (1..key_count) },
+                                  sub { $old->get('no-such-key') });
+
+            merge_hash($bench, $res);
+        }
+    }
+
+    if (defined $value and NOWAIT) {
         # We call nowait_push here.  Otherwise the time of gathering
         # the results would be added to the following commands.
-        my $b2 = timeit(1, sub { $new->nowait_push });
-
-        my $res = timesum($b1, $b2);
-        print "$title: ", timestr($res, 'auto'), "\n";
-
-        merge_hash($bench, { $title => $res });
+        my $res = bench_finalize("$method nowait",
+                                 sub { $new->$method(&$params('pw'))
+                                         foreach (1..key_count) },
+                                 sub { $new->nowait_push });
+        merge_hash($bench, $res);
     }
 
     my $method_multi = "${method}_multi";
@@ -201,29 +230,30 @@ sub run {
              => sub { my @res = $new->$method_multi(&$params_multi('m@')) },
     ) if defined $value;
 
-    if (defined $value and NOREPLY) {
-        push @test, (
-            "$method_multi noreply"
-                => sub { $new_noreply->$method_multi(&$params_multi('mr')) },
-        );
-    }
-
     merge_hash($bench, timethese($count, {@test}));
 
-    if (defined $value and NOWAIT) {
-        my $title = "$method_multi nowait";
-        print "Benchmark: timing $count iterations of $title...\n";
-        my $b1 = timeit($count,
-                        sub { $new->$method_multi(&$params_multi('mw')) });
+    if (defined $value and NOREPLY) {
+        # We call get('no-such-key') here.  Otherwise the time of
+        # sending the requests might be added to the following
+        # commands.
+        my $res = bench_finalize("$method_multi noreply",
+                                 sub { $new_noreply->
+                                         $method_multi(&$params_multi('mr')) },
+                                 sub { $new_noreply->get('no-such-key') });
 
+        merge_hash($bench, $res);
+    }
+
+    if (defined $value and NOWAIT) {
         # We call nowait_push here.  Otherwise the time of gathering
         # the results would be added to the following commands.
-        my $b2 = timeit(1, sub { $new->nowait_push });
+        my $res = bench_finalize("$method_multi nowait",
+                                 sub {
+                                     $new->$method_multi(&$params_multi('mw'))
+                                 },
+                                 sub { $new->nowait_push });
 
-        my $res = timesum($b1, $b2);
-        print "$title: ", timestr($res, 'auto'), "\n";
-
-        merge_hash($bench, { $title => $res });
+        merge_hash($bench, $res);
     }
 
     cmpthese($bench);
