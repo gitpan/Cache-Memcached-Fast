@@ -26,6 +26,7 @@
 #include "connect.h"
 #include "parse_keyword.h"
 #include "dispatch_key.h"
+#include "compute_crc32.h"
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/uio.h>
@@ -37,6 +38,8 @@
 #include <sys/socket.h>
 #include <signal.h>
 #include <time.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 
 
 #ifndef MAX_IOVEC
@@ -92,6 +95,9 @@ enum command_phase
 };
 
 
+enum socket_mode_e { NOT_TCP = -1, TCP_LATENCY, TCP_THROUGHPUT };
+
+
 struct client;
 
 
@@ -99,6 +105,7 @@ struct command_state
 {
   struct client *client;
   int fd;
+  enum socket_mode_e socket_mode;
   int noreply;
   int last_cmd_noreply;
 
@@ -255,6 +262,7 @@ struct client
   int failure_timeout;          /* 1 sec.  */
   int close_on_error;
   int nowait;
+  int hash_namespace;
 
   struct array index_list;
   struct array str_buf;
@@ -351,6 +359,7 @@ client_init()
   c->failure_timeout = 10;
   c->close_on_error = 1;
   c->nowait = 0;
+  c->hash_namespace = 0;
 
   c->generation = 1;            /* Different from initial command state.  */
 
@@ -444,6 +453,13 @@ client_set_nowait(struct client *c, int enable)
 }
 
 
+void
+client_set_hash_namespace(struct client *c, int enable)
+{
+  c->hash_namespace = enable;
+}
+
+
 int
 client_add_server(struct client *c, const char *host, size_t host_len,
                   const char *port, size_t port_len, double weight,
@@ -486,6 +502,10 @@ client_set_prefix(struct client *c, const char *ns, size_t ns_len)
           c->prefix = " ";
           c->prefix_len = 1;
         }
+
+      if (c->hash_namespace)
+        dispatch_set_prefix_crc32(&c->dispatch, 0x0U);
+
       return MEMCACHED_SUCCESS;
     }
 
@@ -502,7 +522,19 @@ client_set_prefix(struct client *c, const char *ns, size_t ns_len)
   c->prefix = s;
   c->prefix_len = 1 + ns_len;
 
+  if (c->hash_namespace)
+    dispatch_set_prefix_crc32(&c->dispatch, compute_crc32(ns, ns_len));
+
   return MEMCACHED_SUCCESS;
+}
+
+
+const char *
+client_get_prefix(struct client *c, size_t *ns_len)
+{
+  *ns_len = c->prefix_len - 1;
+
+  return (c->prefix + 1);
 }
 
 
@@ -1492,6 +1524,44 @@ client_execute(struct client *c)
 }
 
 
+/* Is the following required for any platform?  */
+#if (! defined(IPPROTO_TCP) && defined(SOL_TCP))
+#define IPPROTO_TCP  SOL_TCP
+#endif
+
+
+static inline
+void
+tcp_optimize_latency(struct command_state *state)
+{
+#ifdef TCP_NODELAY
+  if (state->socket_mode == TCP_THROUGHPUT)
+    {
+      static const int enable = 1;
+      setsockopt(state->fd, IPPROTO_TCP, TCP_NODELAY,
+                 &enable, sizeof(enable));
+      state->socket_mode = TCP_LATENCY;
+    }
+#endif /* TCP_NODELAY */
+}
+
+
+static inline
+void
+tcp_optimize_throughput(struct command_state *state)
+{
+#ifdef TCP_NODELAY
+  if (state->socket_mode == TCP_LATENCY)
+    {
+      static const int disable = 0;
+      setsockopt(state->fd, IPPROTO_TCP, TCP_NODELAY,
+                 &disable, sizeof(disable));
+      state->socket_mode = TCP_THROUGHPUT;
+    }
+#endif /* TCP_NODELAY */
+}
+
+
 static
 int
 get_server_fd(struct client *c, struct server *s)
@@ -1517,10 +1587,14 @@ get_server_fd(struct client *c, struct server *s)
         {
           state->fd = client_connect_inet(s->host, s->port,
                                           1, c->connect_timeout);
+          /* This is to trigger actual reset.  */
+          state->socket_mode = TCP_THROUGHPUT;
+          tcp_optimize_latency(state);
         }
       else
         {
           state->fd = client_connect_unix(s->host, s->host_len);
+          state->socket_mode = NOT_TCP;
         }
     }
 
@@ -1582,13 +1656,17 @@ init_state(struct command_state *state, int index, size_t request_size,
       if (state->client->noreply)
         {
           if (state->client->nowait || state->noreply)
-            parse_reply = NULL;
+            {
+              parse_reply = NULL;
+              tcp_optimize_throughput(state);
+            }
 
           state->last_cmd_noreply = state->noreply;
         }
       else
         {
           state->last_cmd_noreply = 0;
+          tcp_optimize_latency(state);
         }
 
       state->object = state->client->object;
@@ -1981,6 +2059,7 @@ client_nowait_push(struct client *c)
       */
       --state->nowait_count;
       command_state_reset(state, 0, parse_nowait_reply);
+      tcp_optimize_latency(state);
       ++state->reply_count;
     }
 

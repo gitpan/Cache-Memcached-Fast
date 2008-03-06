@@ -14,11 +14,11 @@ Cache::Memcached::Fast - Perl client for B<memcached>, in C language
 
 =head1 VERSION
 
-Version 0.08.
+Version 0.09.
 
 =cut
 
-our $VERSION = '0.08';
+our $VERSION = '0.09';
 
 
 =head1 SYNOPSIS
@@ -28,7 +28,7 @@ our $VERSION = '0.08';
   my $memd = new Cache::Memcached::Fast({
       servers => [ { address => 'localhost:11211', weight => 2.5 },
                    '192.168.254.2:11211',
-                   { address => '/path/to/unix.sock' } ],
+                   { address => '/path/to/unix.sock', noreply => 1 } ],
       namespace => 'my:',
       connect_timeout => 0.2,
       io_timeout => 0.5,
@@ -41,6 +41,7 @@ our $VERSION = '0.08';
       failure_timeout => 2,
       ketama_points => 150,
       nowait => 1,
+      hash_namespace => 1,
       serialize_methods => [ \&Storable::freeze, \&Storable::thaw ],
       utf8 => ($^V ge v5.8.1 ? 1 : 0),
   });
@@ -71,7 +72,7 @@ our $VERSION = '0.08';
   $memd->prepend('skey', 'This is a ');
   $memd->prepend_multi(['skey2', 'This is a '], ['skey3', 'prefix ']);
   $memd->append('skey', 'ue.');
-  $memd->prepend_multi(['skey2', 'ue.'], ['skey3', ' suffix']);
+  $memd->append_multi(['skey2', 'ue.'], ['skey3', ' suffix']);
 
   # Do arithmetic.
   $memd->incr('nkey', 10);
@@ -138,7 +139,7 @@ XSLoader::load('Cache::Memcached::Fast', $VERSION);
 
 =over
 
-=item I<new>
+=item C<new>
 
   my $memd = new Cache::Memcached::Fast($params);
 
@@ -157,15 +158,23 @@ client parameters.  Currently recognized keys are:
 The value is a reference to an array of server addresses.  Each
 address is either a scalar, a hash reference, or an array reference
 (for compatibility with Cache::Memcached, deprecated).  If hash
-reference, the keys are I<address> (scalar) and I<weight> (positive
-rational number).  The server address is in the form I<host:port> for
-network TCP connections, or F</path/to/unix.sock> for local Unix
-socket connections.  When weight is not given, 1 is assumed.  Client
-will distribute keys across servers proportionally to server weights.
+reference, the keys are I<address> (scalar), I<weight> (positive
+rational number), and I<noreply> (boolean flag).  The server address
+is in the form I<host:port> for network TCP connections, or
+F</path/to/unix.sock> for local Unix socket connections.  When weight
+is not given, 1 is assumed.  Client will distribute keys across
+servers proportionally to server weights.
 
 If you want to get key distribution compatible with Cache::Memcached,
 all server weights should be integer, and their sum should be less
 than 32768.
+
+When I<noreply> is enabled, commands executed in a void context will
+instruct the server to not send the reply.  Compare with L</nowait>
+below.  B<memcached> server implements I<noreply> starting with
+version 1.2.5.  If you enable I<noreply> for earlier server versions,
+things will go wrongly, and the client will eventually block.  Use
+with care.
 
 
 =item I<namespace>
@@ -176,6 +185,36 @@ than 32768.
 The value is a scalar that will be prepended to all key names passed
 to the B<memcached> server.  By using different namespaces clients
 avoid interference with each other.
+
+
+=item I<hash_namespace>
+
+  hash_namespace => 1
+  (default: disabled)
+
+The value is a boolean which enables (true) or disables (false) the
+hashing of the namespace key prefix.  By default for compatibility
+with B<Cache::Memcached> namespace prefix is not hashed along with the
+key.  Thus
+
+  namespace => 'prefix/',
+  ...
+  $memd->set('key', $val);
+
+may use different B<memcached> server than
+
+  namespace => '',
+  ...
+  $memd->set('prefix/key', $val);
+
+because hash values of I<'key'> and I<'prefix/key'> may be different.
+
+However sometimes is it necessary to hash the namespace prefix, for
+instance for interoperability with other clients that do not have the
+notion of the namespace.  When I<hash_namespace> is enabled, both
+examples above will use the same server, the one that I<'prefix/key'>
+is mapped to.  Note that there's no performance penalty then, as
+namespace prefix is hashed only once.  See L</namespace>.
 
 
 =item I<nowait>
@@ -436,6 +475,7 @@ our %known_params = (
     servers => [ { address => 1, weight => 1, noreply => 1 } ],
     namespace => 1,
     nowait => 1,
+    hash_namespace => 1,
     connect_timeout => 1,
     io_timeout => 1,
     select_timeout => 1,
@@ -542,6 +582,23 @@ L</compress_threshold> to some positive value and L</compress_methods>
 is set.
 
 I<Return:> none.
+
+=cut
+
+# See Fast.xs.
+
+
+=item C<namespace>
+
+  $memd->namespace();
+  $memd->namespace($string);
+
+Without the argument return the current namespace prefix.  With the
+argument set the namespace prefix to I<$string>, and return the old
+prefix.
+
+I<Return:> scalar, the namespace prefix that was in effect before the
+call.
 
 =cut
 

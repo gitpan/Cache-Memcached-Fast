@@ -151,17 +151,8 @@ parse_serialize(Cache_Memcached_Fast *memd, HV *conf)
   if (ps && SvOK(*ps))
     {
       AV *av = (AV *) SvRV(*ps);
-      SV *sv;
-
-      sv = *av_fetch(av, 0, 0);
-      if (! (sv && SvROK(sv) && SvTYPE(SvRV(sv)) == SVt_PVCV))
-        croak("Serialize method is not a code reference");
-      memd->serialize_method = SvRV(sv);
-
-      sv = *av_fetch(av, 1, 0);
-      if (! (sv && SvROK(sv) && SvTYPE(SvRV(sv)) == SVt_PVCV))
-        croak("Deserialize method is not a code reference");
-      memd->deserialize_method = SvRV(sv);
+      memd->serialize_method = newSVsv(*av_fetch(av, 0, 0));
+      memd->deserialize_method = newSVsv(*av_fetch(av, 1, 0));
     }
 
   if (! memd->serialize_method)
@@ -281,6 +272,10 @@ parse_config(Cache_Memcached_Fast *memd, HV *conf)
   ps = hv_fetch(conf, "nowait", 6, 0);
   if (ps && SvOK(*ps))
     client_set_nowait(c, SvTRUE(*ps));
+
+  ps = hv_fetch(conf, "hash_namespace", 14, 0);
+  if (ps && SvOK(*ps))
+    client_set_hash_namespace(c, SvTRUE(*ps));
 
   parse_compress(memd, conf);
   parse_serialize(memd, conf);
@@ -560,7 +555,7 @@ void
 result_store(void *arg, void *opaque, int key_index, void *meta)
 {
   AV *av = (AV *) arg;
-  int res = (int) opaque;
+  int res = (long) opaque;
 
   /* Suppress warning about unused meta.  */
   if (meta) {}
@@ -619,6 +614,11 @@ DESTROY(memd)
           {
             SvREFCNT_dec(memd->compress_method);
             SvREFCNT_dec(memd->decompress_method);
+          }
+        if (memd->serialize_method)
+          {
+            SvREFCNT_dec(memd->serialize_method);
+            SvREFCNT_dec(memd->deserialize_method);
           }
         SvREFCNT_dec(memd->servers);
         free(memd);
@@ -1221,6 +1221,26 @@ server_versions(memd)
                 if (! he)
                   SvREFCNT_dec(*version);
               }
+          }
+    OUTPUT:
+        RETVAL
+
+
+SV *
+namespace(memd, ...)
+        Cache_Memcached_Fast *  memd
+    PROTOTYPE: $;$
+    PREINIT:
+        const char *ns;
+        size_t len;
+    CODE:
+        ns = client_get_prefix(memd->c, &len);
+        RETVAL = newSVpv(ns, len);
+        if (items > 1)
+          {
+            ns = SvPV(ST(1), len);
+            if (client_set_prefix(memd->c, ns, len) != MEMCACHED_SUCCESS)
+              croak("Not enough memory");
           }
     OUTPUT:
         RETVAL

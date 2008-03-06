@@ -17,7 +17,7 @@ use strict;
 # doesn't adopt to it right away.  Instead, for some time a lot of
 # small-range ACK packets are being sent, and this increases the
 # latency.  Because of this '*_multi (%h)', which comes first, has
-# bigger wallclock time than '*_multi (%h)', which comes next.  I
+# bigger wallclock time than '*_multi (@h)', which comes next.  I
 # tried pre-warming the connection, but this doesn't help in all
 # cases.  Seems like 'noreply' mode is also affected, and maybe
 # 'nowait'.
@@ -98,8 +98,20 @@ if (keys %$version != @addrs) {
     exit 1;
 }
 
+my $min_version = 2 ** 31;
+while (my ($s, $v) = each %$version) {
+    if ($v =~ /(\d+)\.(\d+)\.(\d+)/) {
+        my $n = $1 * 10000 + $2 * 100 + $3;
+        $min_version = $n if $n < $min_version;
+    } else {
+        warn "Can't parse version of $s: $v";
+        exit 1;
+    }
+}
 
-@addrs = map { +{ address => $_, noreply => NOREPLY } } @addrs;
+my $noreply = NOREPLY && $min_version >= 10205;
+
+@addrs = map { +{ address => $_, noreply => $noreply } } @addrs;
 
 my $new_noreply = new Cache::Memcached::Fast {
     servers   => [@addrs],
@@ -180,7 +192,7 @@ sub run {
 
     my $bench = timethese($count, {@test});
 
-    if (defined $value and NOREPLY) {
+    if (defined $value and $noreply) {
         # We call get('no-such-key') here.  Otherwise the time of
         # sending the requests might be added to the following
         # commands.
@@ -232,7 +244,7 @@ sub run {
 
     merge_hash($bench, timethese($count, {@test}));
 
-    if (defined $value and NOREPLY) {
+    if (defined $value and $noreply) {
         # We call get('no-such-key') here.  Otherwise the time of
         # sending the requests might be added to the following
         # commands.
@@ -284,4 +296,16 @@ srand(1);
 foreach my $args (@methods) {
     my $sub = splice(@$args, 1, 1);
     &$sub(@$args);
+}
+
+
+# Benchmark latency issues.
+if ($noreply) {
+    cmpthese(timethese($count, {
+        "set noreply followed by get"
+            => sub {
+                $new_noreply->set('snfbg', $value);
+                my $res = $new_noreply->get('snfbg');
+            }
+    }));
 }
