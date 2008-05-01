@@ -24,7 +24,6 @@
 #include "dispatch_key.h"
 #include "compute_crc32.h"
 #include <string.h>
-#include <stdlib.h>
 
 
 /*
@@ -58,11 +57,21 @@ dispatch_find_bucket(struct dispatch_state *state, unsigned int point)
     {
       struct continuum_point *middle = left + (right - left) / 2;
       if (middle->point < point)
-        left = middle + 1;
+        {
+          left = middle + 1;
+        }
       else if (middle->point > point)
-        right = middle;
+        {
+          right = middle;
+        }
       else
-        return middle;
+        {
+          /* Find the first point for this value.  */
+          while (middle != beg && (middle - 1)->point == point)
+            --middle;
+
+          return middle;
+        }
     }
 
   /* Wrap around.  */
@@ -90,14 +99,23 @@ compatible_add_server(struct dispatch_state *state, double weight, int index)
     return -1;
 
   state->total_weight += weight;
-  scale = (1 - weight / state->total_weight);
+  scale = weight / state->total_weight;
+  /*
+    Note that during iterative scaling below the rounding error
+    accumulates.  However the offset to the smaller values is alright
+    as long as it is smaller than the interval length, which is big
+    enough for sane number of servers (thousands) and relative weight
+    ratios.
+  */
   for (array_each(state->buckets, struct continuum_point, p))
-    p->point = ((double) p->point * scale + 0.5);
+    p->point -= (double) p->point * scale;
 
   /* Here p points to array_end().  */
   p->point = DISPATCH_MAX_POINT;
   p->index = index;
   array_push(state->buckets);
+
+  ++state->server_count;
 
   return 0;
 }
@@ -111,7 +129,7 @@ compatible_get_server(struct dispatch_state *state,
   /*
     For compatibility with Cache::Memcached we do the following: first
     we compute 'hash' the same way the original module does.  Since
-    that module put 'weight' copies of each the server into buckets
+    that module puts 'weight' copies of each server into buckets
     array, our '(unsigned int) (state->total_weight + 0.5)' is equal
     to the number of such buckets (0.5 is there for proper rounding).
     Then we scale 'point' to the continuum, and since each server
@@ -119,11 +137,11 @@ compatible_get_server(struct dispatch_state *state,
     server index.
   */
   struct continuum_point *p;
-  unsigned int crc32 = compute_crc32_add(state->prefix_crc32, key, key_len);
-  unsigned int hash = ((crc32 >> 16) & 0x00007fff);
+  unsigned int crc32 = compute_crc32_add(state->prefix_hash, key, key_len);
+  unsigned int hash = (crc32 >> 16) & 0x00007fffU;
   unsigned int point = hash % (unsigned int) (state->total_weight + 0.5);
 
-  point = ((double) point / state->total_weight * DISPATCH_MAX_POINT + 0.5);
+  point = (double) point / state->total_weight * DISPATCH_MAX_POINT + 0.5;
   /*
     Shift point one step forward to possibly get from the border point
     which belongs to the previous bucket.
@@ -146,7 +164,7 @@ ketama_crc32_add_server(struct dispatch_state *state,
   unsigned int crc32;
   int count, i;
 
-  count = (state->ketama_points * weight + 0.5);
+  count = state->ketama_points * weight + 0.5;
 
   if (array_extend(state->buckets, struct continuum_point,
                    count, ARRAY_EXTEND_EXACT) == -1)
@@ -175,32 +193,31 @@ ketama_crc32_add_server(struct dispatch_state *state,
 
       if (! array_empty(state->buckets))
         {
+          struct continuum_point *end =
+            array_end(state->buckets, struct continuum_point);
+
           p = dispatch_find_bucket(state, point);
 
           /* Check if we wrapped around but actually have new max point.  */
           if (p == array_beg(state->buckets, struct continuum_point)
               && point > p->point)
             {
-              p = array_end(state->buckets, struct continuum_point);
+              p = end;
             }
           else
             {
-              if (point == p->point)
-                {
-                  /*
-                    Even if there's a server for the same point
-                    already, we have to add ours, because the first
-                    one may be removed later.  But we add ours after
-                    the first server for not to change key
-                    distribution.
-                  */
-                  ++p;
-                }
+              /*
+                Even if there's a server for the same point already,
+                we have to add ours, because the first one may be
+                removed later.  But we add ours after the old servers
+                for not to change key distribution.
+              */
+              while (p != end && p->point == point)
+                ++p;
 
               /* Move the tail one position forward.  */
-              memmove(p + 1, p,
-                      ((array_end(state->buckets, struct continuum_point) - p)
-                       * sizeof(*p)));
+              if (p != end)
+                memmove(p + 1, p, (end - p) * sizeof(*p));
             }
         }
       else
@@ -213,6 +230,8 @@ ketama_crc32_add_server(struct dispatch_state *state,
       array_push(state->buckets);
     }
 
+  ++state->server_count;
+
   return 0;
 }
 
@@ -222,7 +241,7 @@ int
 ketama_crc32_get_server(struct dispatch_state *state,
                         const char *key, size_t key_len)
 {
-  unsigned int point = compute_crc32_add(state->prefix_crc32, key, key_len);
+  unsigned int point = compute_crc32_add(state->prefix_hash, key, key_len);
   struct continuum_point *p = dispatch_find_bucket(state, point);
   return p->index;
 }
@@ -234,7 +253,8 @@ dispatch_init(struct dispatch_state *state)
   array_init(&state->buckets);
   state->total_weight = 0.0;
   state->ketama_points = 0;
-  state->prefix_crc32 = 0x0U;
+  state->prefix_hash = 0x0U;
+  state->server_count = 0;
 }
 
 
@@ -253,9 +273,10 @@ dispatch_set_ketama_points(struct dispatch_state *state, int ketama_points)
 
 
 void
-dispatch_set_prefix_crc32(struct dispatch_state *state, unsigned int crc32)
+dispatch_set_prefix(struct dispatch_state *state,
+                    const char *prefix, size_t prefix_len)
 {
-  state->prefix_crc32 = crc32;
+  state->prefix_hash = compute_crc32(prefix, prefix_len);
 }
 
 
@@ -276,10 +297,10 @@ dispatch_add_server(struct dispatch_state *state,
 int
 dispatch_key(struct dispatch_state *state, const char *key, size_t key_len)
 {
-  if (array_empty(state->buckets))
+  if (state->server_count == 0)
     return -1;
 
-  if (array_size(state->buckets) == 1)
+  if (state->server_count == 1)
     {
       struct continuum_point *p =
         array_beg(state->buckets, struct continuum_point);

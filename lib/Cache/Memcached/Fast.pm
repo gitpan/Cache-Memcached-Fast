@@ -14,11 +14,11 @@ Cache::Memcached::Fast - Perl client for B<memcached>, in C language
 
 =head1 VERSION
 
-Version 0.09.
+Version 0.10.
 
 =cut
 
-our $VERSION = '0.09';
+our $VERSION = '0.10';
 
 
 =head1 SYNOPSIS
@@ -152,7 +152,7 @@ client parameters.  Currently recognized keys are:
 
   servers => [ { address => 'localhost:11211', weight => 2.5 },
                '192.168.254.2:11211',
-               { address => '/path/to/unix.sock' } ],
+               { address => '/path/to/unix.sock', noreply => 1 } ],
   (default: none)
 
 The value is a reference to an array of server addresses.  Each
@@ -590,7 +590,7 @@ I<Return:> none.
 
 =item C<namespace>
 
-  $memd->namespace();
+  $memd->namespace;
   $memd->namespace($string);
 
 Without the argument return the current namespace prefix.  With the
@@ -1358,7 +1358,7 @@ management, design suggestions, testing.
 
 =head1 ACKNOWLEDGEMENTS
 
-Development of this module is sponsored by S<Monashev Co. Ltd.>
+Development of this module was sponsored by S<Monashev Co. Ltd.>
 
 Thanks to S<Peter J. Holzer> for enlightening on UTF-8 support.
 
