@@ -1,5 +1,5 @@
 /*
-  Copyright (C) 2007 Tomash Brechko.  All rights reserved.
+  Copyright (C) 2008 Tomash Brechko.  All rights reserved.
 
   When used to build Perl module:
 
@@ -21,19 +21,31 @@
   Lesser General Public License for more details.
 */
 
-#ifndef CONNECT_H
-#define CONNECT_H 1
+#ifndef POLL_SELECT_H
+#define POLL_SELECT_H 1
 
-#include <stddef.h>
+
+#undef  POLLIN
+#define POLLIN   0x1
+#undef  POLLOUT
+#define POLLOUT  0x2
+#undef  POLLERR
+#define POLLERR  0x4
+#undef  POLLHUP
+#define POLLHUP  0x4
+
+
+struct pollfd
+{
+  int fd;                       /* File descriptor.  */
+  short events;                 /* Requested events.  */
+  short revents;                /* Returned events.  */
+};
 
 
 extern
 int
-client_connect_inet(const char *host, const char *port, int timeout);
-
-extern
-int
-client_connect_unix(const char *path, size_t path_len);
+poll_select(struct pollfd *fds, int nfds, int timeout);
 
 
-#endif /* ! CONNECT_H */
+#endif  /* ! POLL_SELECT_H */

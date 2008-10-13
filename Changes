@@ -1,5 +1,38 @@
 Revision history for Perl extension Cache::Memcached::Fast.
 
+0.13  2008-10-13
+        - introduce Win32 support (based on the patch by Yasuhiro
+        Matsumoto---arigatou!), and use poll() instead of select()
+        (suggested by Vladimir Timofeev).
+
+        Changes since 0.12:
+
+        Add support for Win32.  I personally don't have the system nor
+        compiler, so I can't even test the build.  Win32 port is
+        expected to be supported by community.  Note: on Win32 below
+        Windows Vista max number of memcached servers is 64.  See
+        comment on FD_SETSIZE in src/socket_win32.h to learn how to
+        increase this value if you need to connect to more than 64
+        servers.
+
+        Use poll() system call instead of select().  The latter has
+        the limit on the file descriptor value.  I.e. even when the
+        number of memcached servers is low, but your application opens
+        lots of other files, then after some point socket() returns
+        fd value larger that select() can handle.  poll() doesn't have
+        this limitation.  On a side note, we don't have to use
+        advanced calls like epoll()/kqueue(), because number of
+        memcached servers is normally not very large (and single
+        request touches even a smaller subset).
+
+        Add bench make target ('make bench').  You may change initial
+        parameters at the top of script/benchmark.pl to benchmark
+        different types of loads.
+
+        Do not install libclient.a.  Thanks to Vladimir Timofeev for
+        finding out how to prevent the installation.
+
+
 0.12  2008-07-21
         - this release fixes compilation on Solaris broken in 0.11.
         If you were able to compile 0.11, then you weren't affected.

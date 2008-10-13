@@ -14,11 +14,11 @@ Cache::Memcached::Fast - Perl client for B<memcached>, in C language
 
 =head1 VERSION
 
-Version 0.12.
+Version 0.13.
 
 =cut
 
-our $VERSION = '0.12';
+our $VERSION = '0.13';
 
 
 =head1 SYNOPSIS
@@ -1380,6 +1380,8 @@ management, design suggestions, testing.
 Development of this module was sponsored by S<Monashev Co. Ltd.>
 
 Thanks to S<Peter J. Holzer> for enlightening on UTF-8 support.
+
+Thanks to S<Yasuhiro Matsumoto> for initial Win32 patch.
 
 
 =head1 WARRANTY

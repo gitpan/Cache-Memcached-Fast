@@ -20,5 +20,9 @@ sub MY::postamble {
 '
 $(MYEXTLIB): src/Makefile
 	cd src && $(MAKE) $(PASTHRU)
+
+bench: all
+	$(PERL) -I./blib/lib -I./blib/arch script/benchmark.pl \
+	  localhost:11211 127.0.0.1:11211
 '
 }

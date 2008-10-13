@@ -1,5 +1,5 @@
 /*
-  Copyright (C) 2007 Tomash Brechko.  All rights reserved.
+  Copyright (C) 2008 Tomash Brechko.  All rights reserved.
 
   When used to build Perl module:
 
@@ -21,19 +21,45 @@
   Lesser General Public License for more details.
 */
 
-#ifndef CONNECT_H
-#define CONNECT_H 1
+#ifndef SOCKET_POSIX_H
+#define SOCKET_POSIX_H 1
 
-#include <stddef.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <errno.h>
+
+#if defined(HAVE_POLL_H)
+
+#include <poll.h>
+
+#define can_poll_fd(fd)  1
+
+#elif defined(HAVE_SYS_POLL_H)
+
+#include <sys/poll.h>
+
+#define can_poll_fd(fd)  1
+
+#else  /* ! defined(HAVE_POLL_H) && ! defined(HAVE_SYS_POLL_H) */
+
+#include "poll_select.h"
+
+#define poll(fds, nfds, timeout)  poll_select(fds, nfds, timeout)
+
+#define can_poll_fd(fd)  ((fd) < FD_SETSIZE)
+
+#endif  /* ! defined(HAVE_POLL_H) && ! defined(HAVE_SYS_POLL_H) */
 
 
 extern
 int
-client_connect_inet(const char *host, const char *port, int timeout);
+set_nonblock(int fd);
 
 extern
 int
-client_connect_unix(const char *path, size_t path_len);
+connect_unix(const char *path, size_t path_len);
 
 
-#endif /* ! CONNECT_H */
+#endif  /* ! SOCKET_POSIX_H */

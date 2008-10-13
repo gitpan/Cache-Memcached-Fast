@@ -1,4 +1,4 @@
-Cache-Memcached-Fast version 0.12
+Cache-Memcached-Fast version 0.13
 =================================
 
 Cache::Memcahced::Fast is a Perl client for memcached, a memory cache
@@ -18,9 +18,12 @@ memcached client implementation in C designed for efficient
 interaction with Perl (actually client code has well defined generic
 API and may be used by itself).
 
-The module should compile and work on any Unix-derived system.
-According to CPAN testers it doesn't compile on Windows, patches are
-welcome.
+The module should compile and work on any Unix-derived system.  Win32
+support is based on the patch by Yasuhiro Matsumoto---thanks!, and is
+(expected to be) supported by community.  Note: on Win32 below Windows
+Vista max number of memcached servers is 64.  See comment on
+FD_SETSIZE in src/socket_win32.h to learn how to increase this value
+if you need to connect to more than 64 servers.
 
 Despite the low version number (which mainly reflects release history)
 the module is considered to be beta (see BUGS below on how to report
