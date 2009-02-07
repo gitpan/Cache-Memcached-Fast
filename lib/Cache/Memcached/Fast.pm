@@ -14,11 +14,11 @@ Cache::Memcached::Fast - Perl client for B<memcached>, in C language
 
 =head1 VERSION
 
-Version 0.13.
+Version 0.14.
 
 =cut
 
-our $VERSION = '0.13';
+our $VERSION = '0.14';
 
 
 =head1 SYNOPSIS
@@ -1129,11 +1129,13 @@ learn what the result value is.
   $memd->flush_all;
   $memd->flush_all($delay);
 
-Flush all caches the client knows about.  I<$delay> is an optional
-non-negative integer number of seconds to delay the operation.  The
-delay will be distributed across the servers.  For instance, when you
-have three servers, and call C<flush_all(30)>, the servers would get
-30, 15, 0 seconds delays respectively.  When omitted, zero is assumed,
+Flush all caches the client knows about.  This command invalidates all
+items in the caches, none of them will be returned on subsequent
+retrieval command.  I<$delay> is an optional non-negative integer
+number of seconds to delay the operation.  The delay will be
+distributed across the servers.  For instance, when you have three
+servers, and call C<flush_all(30)>, the servers would get 30, 15, 0
+seconds delays respectively.  When omitted, zero is assumed,
 i.e. flush immediately.
 
 I<Return:> reference to hash, where I<$href-E<gt>{$server}> holds
@@ -1179,6 +1181,22 @@ Get server versions.
 I<Return:> reference to hash, where I<$href-E<gt>{$server}> holds
 corresponding server version.  I<$server> is either I<host:port> or
 F</path/to/unix.sock>, as described in L</servers>.
+
+=cut
+
+# See Fast.xs.
+
+
+=item C<disconnect_all>
+
+  $memd->disconnect_all;
+
+Closes all open sockets to memcached servers.  Must be called after
+L<perlfunc/fork> if the parent process has open sockets to memcacheds (as the
+child process inherits the socket and thus two processes end up using the same
+socket which leads to protocol errors.)
+
+I<Return:> nothing.
 
 =cut
 
@@ -1284,17 +1302,6 @@ I<compress_threshold> during client object construction.
 
 Not supported.  Perhaps will appear in the future releases.
 
-
-=item C<disconnect_all>
-
-Not supported.  Easy to add.  Meanwhile to disconnect from all servers
-you may do
-
-  undef $memd;
-
-or 
-
-  $memd = undef;
 
 =back
 
