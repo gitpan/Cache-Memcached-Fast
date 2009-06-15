@@ -14,11 +14,11 @@ Cache::Memcached::Fast - Perl client for B<memcached>, in C language
 
 =head1 VERSION
 
-Version 0.14.
+Version 0.15.
 
 =cut
 
-our $VERSION = '0.14';
+our $VERSION = '0.15';
 
 
 =head1 SYNOPSIS
@@ -80,6 +80,7 @@ our $VERSION = '0.14';
   print "OK\n" if $memd->decr('nkey', 3) == 12;
 
   my @counters = qw(c1 c2);
+  $memd->set_multi(map { [$_, 0] } @counters, 'c3', 'c4');
   $memd->incr_multi(['c3', 2], @counters, ['c4', 10]);
 
   # Retrieve values.
@@ -983,10 +984,10 @@ B<gets> command first appeared in B<memcached> 1.2.4.
   $memd->incr($key);
   $memd->incr($key, $increment);
 
-Increment the value for the I<$key>.  If current value is not a
-number, zero is assumed.  An optional I<$increment> should be a
-positive integer, when not given 1 is assumed.  Note that the server
-doesn't check for overflow.
+Increment the value for the I<$key>.  Starting with B<memcached> 1.3.3
+I<$key> should be set to a number or the command will fail.  An
+optional I<$increment> should be a positive integer, when not given 1
+is assumed.  Note that the server doesn't check for overflow.
 
 I<Return:> unsigned integer, new value for the I<$key>, or false for
 negative server reply, or I<undef> in case of some error.
@@ -1028,12 +1029,13 @@ learn what the result value is.
   $memd->decr($key);
   $memd->decr($key, $decrement);
 
-Decrement the value for the I<$key>.  If current value is not a
-number, zero is assumed.  An optional I<$decrement> should be a
-positive integer, when not given 1 is assumed.  Note that the server
-I<does> check for underflow, attempt to decrement the value below zero
-would set the value to zero.  Similar to L<DBI|DBI>, zero is returned
-as I<"0E0">, and evaluates to true in a boolean context.
+Decrement the value for the I<$key>.  Starting with B<memcached> 1.3.3
+I<$key> should be set to a number or the command will fail.  An
+optional I<$decrement> should be a positive integer, when not given 1
+is assumed.  Note that the server I<does> check for underflow, attempt
+to decrement the value below zero would set the value to zero.
+Similar to L<DBI|DBI>, zero is returned as I<"0E0">, and evaluates to
+true in a boolean context.
 
 I<Return:> unsigned integer, new value for the I<$key>, or false for
 negative server reply, or I<undef> in case of some error.
@@ -1399,7 +1401,7 @@ There's B<NONE>, neither explicit nor implied.  But you knew it already
 
 =head1 COPYRIGHT AND LICENSE
 
-Copyright (C) 2007-2008 Tomash Brechko.  All rights reserved.
+Copyright (C) 2007-2009 Tomash Brechko.  All rights reserved.
 
 This library is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself, either Perl version 5.8.8 or,

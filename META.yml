@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:                Cache-Memcached-Fast
-version:             0.14
+version:             0.15
 abstract:            Perl client for B<memcached>, in C language
 license:             ~
 author:              
