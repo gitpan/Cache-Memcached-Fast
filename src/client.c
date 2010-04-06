@@ -1,5 +1,5 @@
 /*
-  Copyright (C) 2007-2009 Tomash Brechko.  All rights reserved.
+  Copyright (C) 2007-2010 Tomash Brechko.  All rights reserved.
 
   When used to build Perl module:
 
@@ -39,11 +39,6 @@
 #else  /* WIN32 */
 #include "socket_win32.h"
 #endif  /* WIN32 */
-
-
-#ifndef MAX_IOVEC
-#define MAX_IOVEC  1024
-#endif
 
 
 /* REPLY_BUF_SIZE should be large enough to contain first reply line.  */
@@ -287,6 +282,8 @@ struct client
   char *prefix;
   size_t prefix_len;
 
+  sigset_t sigpipe_mask;
+
   int connect_timeout;          /* 1/1000 sec.  */
   int io_timeout;               /* 1/1000 sec.  */
   int max_failures;
@@ -297,6 +294,7 @@ struct client
 
   struct array index_list;
   struct array str_buf;
+  int iov_max;
 
   generation_type generation;
 
@@ -390,6 +388,9 @@ client_init()
 
   dispatch_init(&c->dispatch);
 
+  sigemptyset(&c->sigpipe_mask);
+  sigaddset(&c->sigpipe_mask, SIGPIPE);
+
   c->connect_timeout = 250;
   c->io_timeout = 1000;
   c->prefix = " ";
@@ -399,6 +400,8 @@ client_init()
   c->close_on_error = 1;
   c->nowait = 0;
   c->hash_namespace = 0;
+
+  c->iov_max = get_iov_max();
 
   c->generation = 1;            /* Different from initial command state.  */
 
@@ -1192,8 +1195,8 @@ send_request(struct command_state *state, struct server *s)
       ssize_t res;
       size_t len;
 
-      count = (state->iov_count < MAX_IOVEC
-               ? state->iov_count : MAX_IOVEC);
+      count = (state->iov_count < state->client->iov_max
+               ? state->iov_count : state->client->iov_max);
 
       state->iov->iov_base =
         (char *) state->iov->iov_base + state->write_offset;
@@ -1438,15 +1441,18 @@ client_execute(struct client *c)
   int first_iter = 1;
 
 #if ! defined(MSG_NOSIGNAL) && ! defined(WIN32)
-  struct sigaction orig, ignore;
-  int res;
+  int sigpipe_pending, sigpipe_unblock = 0;
+  sigset_t pending;
 
-  ignore.sa_handler = SIG_IGN;
-  sigemptyset(&ignore.sa_mask);
-  ignore.sa_flags = 0;
-  res = sigaction(SIGPIPE, &ignore, &orig);
-  if (res == -1)
-    return MEMCACHED_FAILURE;
+  sigpending(&pending);
+  sigpipe_pending = sigismember(&pending, SIGPIPE);
+  if (! sigpipe_pending)
+    {
+      sigset_t blocked;
+
+      pthread_sigmask(SIG_BLOCK, &c->sigpipe_mask, &blocked);
+      sigpipe_unblock = ! sigismember(&blocked, SIGPIPE);
+    }
 #endif /* ! defined(MSG_NOSIGNAL) && ! defined(WIN32) */
 
   while (1)
@@ -1552,11 +1558,22 @@ client_execute(struct client *c)
     }
 
 #if ! defined(MSG_NOSIGNAL) && ! defined(WIN32)
-  /*
-    Ignore return value of sigaction(), there's nothing we can do in
-    the case of error.
-  */
-  sigaction(SIGPIPE, &orig, NULL);
+  if (! sigpipe_pending)
+    {
+      sigpending(&pending);
+      if (sigismember(&pending, SIGPIPE))
+        {
+          static const struct timespec nowait = { 0, 0 };
+          int res;
+
+          do
+            res = sigtimedwait(&c->sigpipe_mask, NULL, &nowait);
+          while (res == -1 && errno == EINTR);
+        }
+
+      if (sigpipe_unblock)
+        pthread_sigmask(SIG_UNBLOCK, &c->sigpipe_mask, NULL);
+    }
 #endif /* ! defined(MSG_NOSIGNAL) && ! defined(WIN32) */
 
   return MEMCACHED_SUCCESS;
