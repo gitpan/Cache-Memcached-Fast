@@ -1,6 +1,21 @@
 Revision history for Perl extension Cache::Memcached::Fast.
 
 
+0.19  2010-04-24
+        - revert SIGPIPE suppression change.  Upgrade if you couldn't
+        build 0.18.
+
+        Changes since 0.18:
+
+        Turned out some orthodox systems do not have sigtimedwait().
+        Since advanced systems that have sigtimedwait() also have
+        MSG_NOSIGNAL and thus do not use SIGPIPE suppression code in
+        question, and other systems have neither MSG_NOSIGNAL nor
+        sigtimedwait(), the only option is to revert to the previous
+        suppression code.  It works correctly unless your program is
+        multi-threaded.
+
+
 0.18  2010-04-06
         - make module thread-safe, and fix several bugs.  No need to
         upgrade unless you experienced limitations mentioned below.
@@ -10,10 +25,6 @@ Revision history for Perl extension Cache::Memcached::Fast.
         Fix RT#56142: handle Perl magic.  Tied scalars, arrays and
         hashes are supported now, as well as Readonly variables and
         other magic stuff.
-
-        Fix SIGPIPE handling, make it thread-safe.  Now we use
-        pthread_sigmask() from <signal.h>.  I hope this won't break
-        the build on some platforms.
 
         Fix t/command.t failure on some Solaris distributions.
 
