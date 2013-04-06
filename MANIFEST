@@ -45,3 +45,5 @@ src/poll_select.c
 src/poll_select.h
 src/addrinfo_hostent.c
 src/addrinfo_hostent.h
+META.yml                                 Module YAML meta-data (added by MakeMaker)
+META.json                                Module JSON meta-data (added by MakeMaker)
