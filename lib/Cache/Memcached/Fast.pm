@@ -14,11 +14,11 @@ Cache::Memcached::Fast - Perl client for B<memcached>, in C language
 
 =head1 VERSION
 
-Version 0.21.
+Version 0.22.
 
 =cut
 
-our $VERSION = '0.21';
+our $VERSION = '0.22';
 
 
 =head1 SYNOPSIS
@@ -438,7 +438,7 @@ exception (call I<die>).  The exception will be caught by the module
 and L</get> will then pretend that the key hasn't been found.
 
 
-=item I<utf8> (B<experimental, Perl 5.8.1 and later>)
+=item I<utf8>
 
   utf8 => 1
   (default: disabled)
@@ -1444,8 +1444,10 @@ L<http://search.cpan.org/dist/Cache-Memcached-Fast>
 
 =head1 SEE ALSO
 
-L<http://openhack.ru/Cache-Memcached-Fast> - project home.  Latest
+L<https://github.com/kroki/Cache-Memcached-Fast> - project home.  Latest
 development tree can be found there.
+
+L<http://openhack.ru/Cache-Memcached-Fast> - old project home.
 
 L<Cache::Memcached|Cache::Memcached> - original pure Perl B<memcached>
 client.
