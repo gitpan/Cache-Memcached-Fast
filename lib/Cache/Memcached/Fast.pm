@@ -14,11 +14,11 @@ Cache::Memcached::Fast - Perl client for B<memcached>, in C language
 
 =head1 VERSION
 
-Version 0.22.
+Version 0.23.
 
 =cut
 
-our $VERSION = '0.22';
+our $VERSION = '0.23';
 
 
 =head1 SYNOPSIS
@@ -115,7 +115,7 @@ our $VERSION = '0.22';
 =head1 DESCRIPTION
 
 B<Cache::Memcached::Fast> is a Perl client for B<memcached>, a memory
-cache daemon (L<http://www.danga.com/memcached/>).  Module core is
+cache daemon (L<http://www.memcached.org/>).  Module core is
 implemented in C and tries hard to minimize number of system calls and
 to avoid any key/value copying for speed.  As a result, it has very
 low CPU consumption.
@@ -1154,6 +1154,53 @@ learn what the result value is.
 # See Fast.xs.
 
 
+=item C<touch>
+
+  $memd->touch($key, $expiration_time);
+
+Update the expiration time of I<$key> without fetching it.
+
+Optional I<$expiration_time> is a positive integer number of seconds
+after which the value will expire and wouldn't be accessible any
+longer.
+
+I<Return:> boolean, true for positive server reply, false for negative
+server reply, or I<undef> in case of some error.
+
+B<touch> command first appeared in B<memcached> 1.4.8.
+
+=cut
+
+# See Fast.xs.
+
+
+=item C<touch_multi>
+
+  $memd->touch_multi(
+      [$key],
+      [$key, $expiration_time],
+      ...
+  );
+
+Like L</touch>, but operates on more than one key.  Takes the list of
+references to arrays each holding I<$key> and optional I<$expiration_time>.
+
+Note that multi commands are not all-or-nothing, some operations may
+succeed, while others may fail.
+
+I<Return:> in list context returns the list of results, each
+I<$list[$index]> is the result value corresponding to the argument at
+position I<$index>.  In scalar context, hash reference is returned,
+where I<$href-E<gt>{$key}> holds the result value.  See L</touch> to
+learn what the result value is.
+
+B<touch> command first appeared in B<memcached> 1.4.8.
+
+=cut
+
+# See Fast.xs.
+
+
 =item C<flush_all>
 
   $memd->flush_all;
@@ -1452,7 +1499,7 @@ L<http://openhack.ru/Cache-Memcached-Fast> - old project home.
 L<Cache::Memcached|Cache::Memcached> - original pure Perl B<memcached>
 client.
 
-L<http://www.danga.com/memcached/> - B<memcached> website.
+L<http://www.memcached.org/> - B<memcached> website.
 
 
 =head1 AUTHORS

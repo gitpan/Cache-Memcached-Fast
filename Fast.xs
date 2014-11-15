@@ -7,6 +7,7 @@
   available.
 */
 
+#define PERL_NO_GET_CONTEXT
 #include "EXTERN.h"
 #include "perl.h"
 #include "XSUB.h"
@@ -42,7 +43,8 @@ typedef struct xs_state Cache_Memcached_Fast;
 
 static
 void
-add_server(Cache_Memcached_Fast *memd, SV *addr_sv, double weight, int noreply)
+add_server(pTHX_ Cache_Memcached_Fast *memd, SV *addr_sv,
+           double weight, int noreply)
 {
   struct client *c = memd->c;
   static const int delim = ':';
@@ -80,11 +82,11 @@ add_server(Cache_Memcached_Fast *memd, SV *addr_sv, double weight, int noreply)
 
 static
 void
-parse_server(Cache_Memcached_Fast *memd, SV *sv)
+parse_server(pTHX_ Cache_Memcached_Fast *memd, SV *sv)
 {
   if (! SvROK(sv))
     {
-      add_server(memd, sv, 1.0, 0);
+      add_server(aTHX_ memd, sv, 1.0, 0);
     }
   else
     {
@@ -112,7 +114,7 @@ parse_server(Cache_Memcached_Fast *memd, SV *sv)
               SvGETMAGIC(*ps);
             if (ps && SvOK(*ps))
               noreply = SvTRUE(*ps);
-            add_server(memd, *addr_sv, weight, noreply);
+            add_server(aTHX_ memd, *addr_sv, weight, noreply);
           }
           break;
 
@@ -130,7 +132,7 @@ parse_server(Cache_Memcached_Fast *memd, SV *sv)
             weight_sv = av_fetch(av, 1, 0);
             if (weight_sv)
               weight = SvNV(*weight_sv);
-            add_server(memd, *addr_sv, weight, 0);
+            add_server(aTHX_ memd, *addr_sv, weight, 0);
           }
           break;
 
@@ -144,7 +146,7 @@ parse_server(Cache_Memcached_Fast *memd, SV *sv)
 
 static
 void
-parse_serialize(Cache_Memcached_Fast *memd, HV *conf)
+parse_serialize(pTHX_ Cache_Memcached_Fast *memd, HV *conf)
 {
   SV **ps;
 
@@ -178,7 +180,7 @@ parse_serialize(Cache_Memcached_Fast *memd, HV *conf)
 
 static
 void
-parse_compress(Cache_Memcached_Fast *memd, HV *conf)
+parse_compress(pTHX_ Cache_Memcached_Fast *memd, HV *conf)
 {
   SV **ps;
 
@@ -218,7 +220,7 @@ parse_compress(Cache_Memcached_Fast *memd, HV *conf)
 
 static
 void
-parse_config(Cache_Memcached_Fast *memd, HV *conf)
+parse_config(pTHX_ Cache_Memcached_Fast *memd, HV *conf)
 {
   struct client *c = memd->c;
   SV **ps;
@@ -260,7 +262,7 @@ parse_config(Cache_Memcached_Fast *memd, HV *conf)
             continue;
 
           SvGETMAGIC(*ps);
-          parse_server(memd, *ps);
+          parse_server(aTHX_ memd, *ps);
         }
     }
 
@@ -327,14 +329,14 @@ parse_config(Cache_Memcached_Fast *memd, HV *conf)
   else
     memd->max_size = 1024 * 1024;
 
-  parse_compress(memd, conf);
-  parse_serialize(memd, conf);
+  parse_compress(aTHX_ memd, conf);
+  parse_serialize(aTHX_ memd, conf);
 }
 
 
 static inline
 SV *
-compress(Cache_Memcached_Fast *memd, SV *sv, flags_type *flags)
+compress(pTHX_ Cache_Memcached_Fast *memd, SV *sv, flags_type *flags)
 {
   if (memd->compress_threshold > 0)
     {
@@ -376,7 +378,7 @@ compress(Cache_Memcached_Fast *memd, SV *sv, flags_type *flags)
 
 static inline
 int
-decompress(Cache_Memcached_Fast *memd, SV **sv, flags_type flags)
+decompress(pTHX_ Cache_Memcached_Fast *memd, SV **sv, flags_type flags)
 {
   int res = 1;
 
@@ -421,7 +423,7 @@ decompress(Cache_Memcached_Fast *memd, SV **sv, flags_type flags)
 
 static inline
 SV *
-serialize(Cache_Memcached_Fast *memd, SV *sv, flags_type *flags)
+serialize(pTHX_ Cache_Memcached_Fast *memd, SV *sv, flags_type *flags)
 {
   if (SvROK(sv))
     {
@@ -465,7 +467,7 @@ serialize(Cache_Memcached_Fast *memd, SV *sv, flags_type *flags)
 
 static inline
 int
-deserialize(Cache_Memcached_Fast *memd, SV **sv, flags_type flags)
+deserialize(pTHX_ Cache_Memcached_Fast *memd, SV **sv, flags_type flags)
 {
   int res = 1;
 
@@ -513,6 +515,7 @@ static
 void *
 alloc_value(value_size_type value_size, void **opaque)
 {
+  dTHX;
   SV *sv;
   char *res;
 
@@ -531,6 +534,7 @@ static
 void
 free_value(void *opaque)
 {
+  dTHX;
   SV *sv = (SV *) opaque;
 
   SvREFCNT_dec(sv);
@@ -548,6 +552,7 @@ static
 void
 svalue_store(void *arg, void *opaque, int key_index, void *meta)
 {
+  dTHX;
   SV *value_sv = (SV *) opaque;
   struct xs_value_result *value_res = (struct xs_value_result *) arg;
   struct meta_object *m = (struct meta_object *) meta;
@@ -555,8 +560,8 @@ svalue_store(void *arg, void *opaque, int key_index, void *meta)
   /* Suppress warning about unused key_index.  */
   if (key_index) {}
 
-  if (! decompress(value_res->memd, &value_sv, m->flags)
-      || ! deserialize(value_res->memd, &value_sv, m->flags))
+  if (! decompress(aTHX_ value_res->memd, &value_sv, m->flags)
+      || ! deserialize(aTHX_ value_res->memd, &value_sv, m->flags))
     {
       free_value(value_sv);
       return;
@@ -581,12 +586,13 @@ static
 void
 mvalue_store(void *arg, void *opaque, int key_index, void *meta)
 {
+  dTHX;
   SV *value_sv = (SV *) opaque;
   struct xs_value_result *value_res = (struct xs_value_result *) arg;
   struct meta_object *m = (struct meta_object *) meta;
 
-  if (! decompress(value_res->memd, &value_sv, m->flags)
-      || ! deserialize(value_res->memd, &value_sv, m->flags))
+  if (! decompress(aTHX_ value_res->memd, &value_sv, m->flags)
+      || ! deserialize(aTHX_ value_res->memd, &value_sv, m->flags))
     {
       free_value(value_sv);
       return;
@@ -611,8 +617,9 @@ static
 void
 result_store(void *arg, void *opaque, int key_index, void *meta)
 {
+  dTHX;
   AV *av = (AV *) arg;
-  int res = (long) opaque;
+  int res = (ptrdiff_t) opaque;
 
   /* Suppress warning about unused meta.  */
   if (meta) {}
@@ -628,6 +635,7 @@ static
 void
 embedded_store(void *arg, void *opaque, int key_index, void *meta)
 {
+  dTHX;
   AV *av = (AV *) arg;
   SV *sv = (SV *) opaque;
 
@@ -649,7 +657,7 @@ embedded_store(void *arg, void *opaque, int key_index, void *meta)
 */
 static inline
 char *
-SvPV_stable_storage(SV *sv, STRLEN *lp)
+SvPV_stable_storage(pTHX_ SV *sv, STRLEN *lp)
 {
   if (SvGAMAGIC(sv))
     sv = sv_2mortal(newSVsv(sv));
@@ -675,7 +683,7 @@ _new(class, conf)
           croak("Not enough memory");
         if (! SvROK(conf) || SvTYPE(SvRV(conf)) != SVt_PVHV)
           croak("Not a hash reference");
-        parse_config(memd, (HV *) SvRV(conf));
+        parse_config(aTHX_ memd, (HV *) SvRV(conf));
         RETVAL = memd;
     OUTPUT:
         RETVAL
@@ -741,7 +749,7 @@ set(memd, ...)
         sv_2mortal((SV *) object.arg);
         noreply = (GIMME_V == G_VOID);
         client_reset(memd->c, &object, noreply);
-        key = SvPV_stable_storage(ST(arg), &key_len);
+        key = SvPV_stable_storage(aTHX_ ST(arg), &key_len);
         ++arg;
         if (ix == CMD_CAS)
           {
@@ -750,9 +758,9 @@ set(memd, ...)
           }
         sv = ST(arg);
         ++arg;
-        sv = serialize(memd, sv, &flags);
-        sv = compress(memd, sv, &flags);
-        buf = (void *) SvPV_stable_storage(sv, &buf_len);
+        sv = serialize(aTHX_ memd, sv, &flags);
+        sv = compress(aTHX_ memd, sv, &flags);
+        buf = (void *) SvPV_stable_storage(aTHX_ sv, &buf_len);
         if (buf_len > memd->max_size)
           XSRETURN_EMPTY;
         if (items > arg)
@@ -830,7 +838,7 @@ set_multi(memd, ...)
               The following values should be defined, so we do not do
               any additional checks for speed.
             */
-            key = SvPV_stable_storage(*av_fetch(av, arg, 0), &key_len);
+            key = SvPV_stable_storage(aTHX_ *av_fetch(av, arg, 0), &key_len);
             ++arg;
             if (ix == CMD_CAS)
               {
@@ -839,9 +847,9 @@ set_multi(memd, ...)
               }
             sv = *av_fetch(av, arg, 0);
             ++arg;
-            sv = serialize(memd, sv, &flags);
-            sv = compress(memd, sv, &flags);
-            buf = (void *) SvPV_stable_storage(sv, &buf_len);
+            sv = serialize(aTHX_ memd, sv, &flags);
+            sv = compress(aTHX_ memd, sv, &flags);
+            buf = (void *) SvPV_stable_storage(aTHX_ sv, &buf_len);
             if (buf_len > memd->max_size)
               continue;
             if (av_len(av) >= arg)
@@ -953,7 +961,7 @@ get_multi(memd, ...)
             const char *key;
             STRLEN key_len;
 
-            key = SvPV_stable_storage(ST(i + 1), &key_len);
+            key = SvPV_stable_storage(aTHX_ ST(i + 1), &key_len);
             client_prepare_get(memd->c, ix, i, key, key_len);
           }
         client_execute(memd->c);
@@ -992,7 +1000,7 @@ incr(memd, ...)
         sv_2mortal((SV *) object.arg);
         noreply = (GIMME_V == G_VOID);
         client_reset(memd->c, &object, noreply);
-        key = SvPV_stable_storage(ST(1), &key_len);
+        key = SvPV_stable_storage(aTHX_ ST(1), &key_len);
         if (items > 2)
           {
             /* increment doesn't have to be defined.  */
@@ -1040,7 +1048,7 @@ incr_multi(memd, ...)
             sv = ST(i);
             if (! SvROK(sv))
               {
-                key = SvPV_stable_storage(sv, &key_len);
+                key = SvPV_stable_storage(aTHX_ sv, &key_len);
               }
             else
               {
@@ -1052,7 +1060,7 @@ incr_multi(memd, ...)
                   The following values should be defined, so we do not
                   do any additional checks for speed.
                 */
-                key = SvPV_stable_storage(*av_fetch(av, 0, 0), &key_len);
+                key = SvPV_stable_storage(aTHX_ *av_fetch(av, 0, 0), &key_len);
                 if (av_len(av) >= 1)
                   {
                     /* increment doesn't have to be defined.  */
@@ -1124,7 +1132,7 @@ delete(memd, ...)
         sv_2mortal((SV *) object.arg);
         noreply = (GIMME_V == G_VOID);
         client_reset(memd->c, &object, noreply);
-        key = SvPV_stable_storage(ST(1), &key_len);
+        key = SvPV_stable_storage(aTHX_ ST(1), &key_len);
         if (items > 2)
           {
             /* Compatibility with old (key, delay) syntax.  */
@@ -1170,7 +1178,7 @@ delete_multi(memd, ...)
             sv = ST(i);
             if (! SvROK(sv))
               {
-                key = SvPV_stable_storage(sv, &key_len);
+                key = SvPV_stable_storage(aTHX_ sv, &key_len);
               }
             else
               {
@@ -1186,7 +1194,7 @@ delete_multi(memd, ...)
                   The following values should be defined, so we do not
                   do any additional checks for speed.
                 */
-                key = SvPV_stable_storage(*av_fetch(av, 0, 0), &key_len);
+                key = SvPV_stable_storage(aTHX_ *av_fetch(av, 0, 0), &key_len);
                 if (av_len(av) >= 1)
                   {
                     /* delay doesn't have to be defined.  */
@@ -1199,6 +1207,134 @@ delete_multi(memd, ...)
               }
  
             client_prepare_delete(memd->c, i - 1, key, key_len);
+          }
+        client_execute(memd->c);
+        if (! noreply)
+          {
+            if (GIMME_V == G_SCALAR)
+              {
+                HV *hv = newHV();
+                for (i = 0; i <= av_len(object.arg); ++i)
+                  {
+                    SV **val = av_fetch(object.arg, i, 0);
+                    if (val && SvOK(*val))
+                      {
+                        SV *key;
+                        HE *he;
+
+                        key = ST(i + 1);
+                        if (SvROK(key))
+                          key = *av_fetch((AV *) SvRV(key), 0, 0);
+
+                        he = hv_store_ent(hv, key, SvREFCNT_inc(*val), 0);
+                        if (! he)
+                          SvREFCNT_dec(*val);
+                      }
+                  }
+                PUSHs(sv_2mortal(newRV_noinc((SV *) hv)));
+                XSRETURN(1);
+              }
+            else
+              {
+                I32 max_index = av_len(object.arg);
+                EXTEND(SP, max_index + 1);
+                for (i = 0; i <= max_index; ++i)
+                  {
+                    SV **val = av_fetch(object.arg, i, 0);
+                    if (val)
+                      PUSHs(*val);
+                    else
+                      PUSHs(&PL_sv_undef);
+                  }
+                XSRETURN(max_index + 1);
+              }
+          }
+
+
+void
+touch(memd, ...)
+        Cache_Memcached_Fast *  memd
+    PROTOTYPE: $@
+    PREINIT:
+        struct result_object object =
+            { NULL, result_store, NULL, NULL };
+        int noreply;
+        const char *key;
+        STRLEN key_len;
+        exptime_type exptime = 0;
+        SV *sv;
+    PPCODE:
+        object.arg = newAV();
+        sv_2mortal((SV *) object.arg);
+        noreply = (GIMME_V == G_VOID);
+        client_reset(memd->c, &object, noreply);
+        key = SvPV_stable_storage(aTHX_ ST(1), &key_len);
+        if (items > 2)
+          {
+            /* exptime doesn't have to be defined.  */
+            sv = ST(2);
+            SvGETMAGIC(sv);
+            if (SvOK(sv))
+              exptime = SvIV(sv);
+          }
+        client_prepare_touch(memd->c, 0, key, key_len, exptime);
+        client_execute(memd->c);
+        if (! noreply)
+          {
+            SV **val = av_fetch(object.arg, 0, 0);
+            if (val)
+              {
+                PUSHs(*val);
+                XSRETURN(1);
+              }
+          }
+
+
+void
+touch_multi(memd, ...)
+        Cache_Memcached_Fast *  memd
+    PROTOTYPE: $@
+    PREINIT:
+        struct result_object object =
+            { NULL, result_store, NULL, NULL };
+        int i, noreply;
+    PPCODE:
+        object.arg = newAV();
+        sv_2mortal((SV *) object.arg);
+        noreply = (GIMME_V == G_VOID);
+        client_reset(memd->c, &object, noreply);
+        for (i = 1; i < items; ++i)
+          {
+            SV *sv;
+            AV *av;
+            const char *key;
+            STRLEN key_len;
+            exptime_type exptime = 0;
+            int arg = 0;
+
+            sv = ST(i);
+            if (! (SvROK(sv) && SvTYPE(SvRV(sv)) == SVt_PVAV))
+              croak("Not an array reference");
+
+            av = (AV *) SvRV(sv);
+            /*
+              The following values should be defined, so we do not do
+              any additional checks for speed.
+            */
+            key = SvPV_stable_storage(aTHX_ *av_fetch(av, arg, 0), &key_len);
+            ++arg;
+
+            if (av_len(av) >= 1)
+              {
+                /* exptime doesn't have to be defined.  */
+                SV **ps = av_fetch(av, arg, 0);
+                if (ps)
+                  SvGETMAGIC(*ps);
+                if (ps && SvOK(*ps))
+                  exptime = SvIV(*ps);
+              }
+
+            client_prepare_touch(memd->c, i - 1, key, key_len, exptime);
           }
         client_execute(memd->c);
         if (! noreply)
